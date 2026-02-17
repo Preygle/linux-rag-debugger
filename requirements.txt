@@ -1,0 +1,11 @@
+langchain
+chromadb
+sentence-transformers
+pandas
+numpy
+tqdm
+requests
+beautifulsoup4
+stackapi
+PyGithub
+lxml

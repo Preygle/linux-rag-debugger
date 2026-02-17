@@ -1,0 +1,25 @@
+# Environment Variables
+.env
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+env/
+
+# Data
+data/
+data/raw/*
+data/processed/*
+data/vectordb/*
+data/training_dataset.jsonl
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
