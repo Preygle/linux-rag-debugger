@@ -1,6 +1,6 @@
 from stackapi import StackAPI
 import os
-import json
+import math
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -16,11 +16,11 @@ class StackExchangeScraper:
         # Consistent settings
         for site in [self.so, self.sf, self.ub]:
             site.page_size = 100
-            site.max_pages = 1
 
     def fetch_questions(self, site_name, tags, limit=50):
         """
         Fetches questions with accepted answers for given tags.
+        Paginates properly to reach the requested limit.
         """
         site = None
         if site_name == 'stackoverflow':
@@ -33,65 +33,47 @@ class StackExchangeScraper:
             print(f"Unknown site: {site_name}")
             return []
 
-        print(f"Fetching from {site_name} for tags: {tags}...")
+        # Calculate pages needed (100 items per page)
+        site.max_pages = max(1, math.ceil(limit / 100))
+        print(f"Fetching from {site_name} for tags: {tags} (max_pages: {site.max_pages})...")
+
         try:
-            questions = site.fetch('questions', 
-                                   tagged=tags, 
-                                   sort='votes', 
-                                   filter='withbody', # Custom filter needed? 'withbody' includes body
-                                   min=1, # At least 1 vote
-                                  )
-            
-            # Filter for accepted answers
-            # Note: The simple fetch above might not include answers. 
-            # We usually need 'questions' with 'filter' that includes answers or make separate call.
-            # Using a built-in filter '!9_bDDxJY5' which includes question body, answers, comments
-            # Or construct a custom one. For simplicitly, let's just get questions first, 
-            # then we might need to fetch answers if not included.
-            
-            # Actually, let's use a standard filter that includes answers body.
-            # Filter '!*SU8CGYZITCB.D*(BDVIficKj7nFMLLDij64nVID)N9aK3GM' is a common extensive one.
-            # But 'withbody' just gives question body.
-            
-            # Let's try to fetch relevant data.
-            # We want: Title, Body, Accepted Answer Body.
-            
-            # 1. Fetch questions
-            print(f"DEBUG: Fetching questions for tags {tags} from {site_name}...")
+            # 1. Fetch questions with body
             questions = site.fetch('questions',
                                    tagged=tags,
                                    sort='votes',
                                    filter='withbody',
                                    min=1,
-                                   pagesize=min(limit, 100)
                                    )
             
             items = questions.get('items', [])
-            print(f"DEBUG: Got {len(items)} questions. Raw keys: {questions.keys()}")
-            if 'error_id' in questions:
-                 print(f"DEBUG: API Error: {questions.get('error_message')}")
+            print(f"Got {len(items)} questions from API.")
 
             if not items:
-                print("DEBUG: No items found.")
+                print("No items found.")
                 return []
 
             # 2. Collect accepted answer IDs
-            answer_ids = [q['accepted_answer_id'] for q in items if 'accepted_answer_id' in q]
+            questions_with_answers = [q for q in items if 'accepted_answer_id' in q]
+            answer_ids = [q['accepted_answer_id'] for q in questions_with_answers]
+            print(f"Questions with accepted answers: {len(questions_with_answers)}")
             
-            # 3. Fetch answers
+            # 3. Fetch answers in batches of 100
             answers_map = {}
             if answer_ids:
-                # Fetch in batches of 100 if needed, but stackapi handles batching usually
-                answers = site.fetch('answers', ids=answer_ids, filter='withbody')
-                for ans in answers.get('items', []):
-                    answers_map[ans['answer_id']] = ans.get('body', '')
+                for i in range(0, len(answer_ids), 100):
+                    batch = answer_ids[i:i+100]
+                    answers = site.fetch('answers', ids=batch, filter='withbody')
+                    for ans in answers.get('items', []):
+                        answers_map[ans['answer_id']] = ans.get('body', '')
+                    print(f"Fetched answers batch {i//100 + 1}: {len(answers.get('items', []))} answers")
 
-            # 4. Merge
+            # 4. Merge Q&A pairs
             processed = []
-            for q in items:
-                if 'accepted_answer_id' not in q:
-                    continue
-                
+            for q in questions_with_answers:
+                if len(processed) >= limit:
+                    break
+                    
                 ans_body = answers_map.get(q['accepted_answer_id'])
                 if not ans_body:
                     continue
@@ -106,10 +88,13 @@ class StackExchangeScraper:
                     'tags': q['tags']
                 })
                 
+            print(f"Total Q&A pairs extracted: {len(processed)}")
             return processed
 
         except Exception as e:
             print(f"Error fetching from {site_name}: {e}")
+            import traceback
+            traceback.print_exc()
             return []
 
 if __name__ == "__main__":

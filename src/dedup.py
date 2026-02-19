@@ -1,20 +1,37 @@
 import hashlib
+import json
+import os
 from typing import List, Dict, Set
 
+HASH_FILE = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'data', 'seen_hashes.json')
+
 class Deduplicator:
-    def __init__(self):
-        self.seen_hashes: Set[str] = set()
+    def __init__(self, hash_file=None):
+        self.hash_file = hash_file or HASH_FILE
+        self.seen_hashes: Set[str] = self._load_hashes()
+
+    def _load_hashes(self) -> Set[str]:
+        """Load previously seen hashes from disk."""
+        if os.path.exists(self.hash_file):
+            try:
+                with open(self.hash_file, 'r') as f:
+                    return set(json.load(f))
+            except (json.JSONDecodeError, IOError):
+                return set()
+        return set()
+
+    def _save_hashes(self):
+        """Persist seen hashes to disk."""
+        os.makedirs(os.path.dirname(self.hash_file), exist_ok=True)
+        with open(self.hash_file, 'w') as f:
+            json.dump(list(self.seen_hashes), f)
 
     def generate_hash(self, content: str) -> str:
-        """
-        Generates an MD5 hash of the content.
-        """
+        """Generates an MD5 hash of the content."""
         return hashlib.md5(content.encode('utf-8')).hexdigest()
 
     def is_duplicate(self, content: str) -> bool:
-        """
-        Checks if the content has been seen before.
-        """
+        """Checks if the content has been seen before."""
         content_hash = self.generate_hash(content)
         if content_hash in self.seen_hashes:
             return True
@@ -22,9 +39,7 @@ class Deduplicator:
         return False
 
     def deduplicate_documents(self, documents: List[Dict[str, str]]) -> List[Dict[str, str]]:
-        """
-        Filters out duplicate documents from a list.
-        """
+        """Filters out duplicate documents (persists across runs)."""
         unique_docs = []
         duplicates = 0
         for doc in documents:
@@ -33,6 +48,9 @@ class Deduplicator:
             else:
                 duplicates += 1
         
+        # Save updated hashes to disk
+        self._save_hashes()
+
         if duplicates > 0:
             print(f"Deduplication: Removed {duplicates} duplicate documents.")
         
@@ -47,3 +65,4 @@ if __name__ == "__main__":
     deduper = Deduplicator()
     unique = deduper.deduplicate_documents(docs)
     print(f"Original: {len(docs)}, Unique: {len(unique)}")
+
