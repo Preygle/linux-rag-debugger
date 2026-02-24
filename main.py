@@ -132,7 +132,7 @@ def main():
     # Ingest command (single source)
     ingest_parser = subparsers.add_parser("ingest", help="Ingest data from a single source")
     ingest_parser.add_argument("--source", help="Path to source directory (for local)", default=None)
-    ingest_parser.add_argument("--type", choices=['local', 'stackexchange', 'github', 'web'], default='local', help="Source type")
+    ingest_parser.add_argument("--type", choices=['local', 'stackexchange', 'github', 'web', 'jsonl'], default='local', help="Source type")
     ingest_parser.add_argument("--limit", type=int, default=10, help="Max documents to fetch")
     ingest_parser.add_argument("--output", help="Path to export JSONL file (extract only, no embedding)", default=None)
     

@@ -60,6 +60,40 @@ def load_documents(source_path: str = None, source_type: str = 'local', limit: i
                         })
                     except Exception as e:
                         print(f"Error loading {file_path}: {e}")
+
+    # JSONL FILE LOADING (Previously Exported Data)
+    elif source_type == 'jsonl':
+        if not source_path or not os.path.exists(source_path):
+            print(f"Directory not found: {source_path}")
+            return documents
+
+        for root, _, files in os.walk(source_path):
+            for file in files:
+                if file.endswith('.jsonl'):
+                    file_path = os.path.join(root, file)
+                    try:
+                        with open(file_path, 'r', encoding='utf-8') as f:
+                            for line in f:
+                                if not line.strip(): continue
+                                data = json.loads(line)
+                                
+                                # Handle SFT (Conversational) format
+                                if 'messages' in data:
+                                    messages = data['messages']
+                                    if len(messages) >= 2:
+                                        content = f"Question:\n{messages[0]['content']}\n\nAnswer:\n{messages[1]['content']}"
+                                        documents.append({
+                                            'content': content,
+                                            'metadata': {'source': file_path, 'type': data.get('source', 'jsonl_sft')}
+                                        })
+                                # Handle Raw Pre-training format
+                                elif 'text' in data:
+                                    documents.append({
+                                        'content': data['text'],
+                                        'metadata': {'source': file_path, 'type': data.get('source', 'jsonl_raw')}
+                                    })
+                    except Exception as e:
+                        print(f"Error loading JSONL {file_path}: {e}")
     
     # STACK EXCHANGE LOADING
     elif source_type == 'stackexchange':
@@ -69,11 +103,18 @@ def load_documents(source_path: str = None, source_type: str = 'local', limit: i
         print(f"Scraping StackExchange for tags: {tags}")
         items = scraper.fetch_questions('stackoverflow', tags, limit=limit)
         for item in items:
-             # Combine Q&A into a single document
+            # Combine Q&A into a single document
             content = f"Title: {item['title']}\n\nQuestion:\n{item['question']}\n\nAnswer:\n{item['answer']}"
             documents.append({
                 'content': content,
-                'metadata': {'source': item['link'], 'type': 'stack_exchange', 'tags': item['tags']}
+                'metadata': {
+                    'source': item['link'], 
+                    'type': 'stack_exchange', 
+                    'tags': item['tags'],
+                    'question': item['question'],
+                    'answer': item['answer'],
+                    'title': item['title']
+                }
             })
 
     # GITHUB LOADING
