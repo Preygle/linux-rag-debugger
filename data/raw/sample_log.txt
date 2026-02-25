@@ -1,0 +1,11 @@
+Error: Kernel panic - not syncing: VFS: Unable to mount root fs on unknown-block(0,0)
+Root Cause: This often happens when the initramfs image is missing or corrupted, or if the bootloader (GRUB) is pointing to the wrong root partition UUID.
+Solution: Reinstall the kernel package or regenerate the initramfs using `update-initramfs -u -k all` (Debian/Ubuntu) or `mkinitcpio -P` (Arch). Also check /etc/fstab and grub configuration.
+
+Error: error while loading shared libraries: libssl.so.1.1: cannot open shared object file: No such file or directory
+Root Cause: The required shared library (libssl) is missing or not in the system library path.
+Solution: Install the `openssl-libs` or `libssl` package. If installed, check `LD_LIBRARY_PATH` or run `ldconfig`.
+
+Error: Segmentation fault (core dumped)
+Root Cause: The program attempted to access a memory region that it is not allowed to access, or attempted to write to read-only memory. Common causes include null pointer dereference, buffer overflow, or stack overflow.
+Solution: Use a debugger like `gdb` to analyze the core dump: `gdb ./program core`. Check for invalid pointers or array out-of-bounds access in the code.
