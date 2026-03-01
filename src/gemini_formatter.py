@@ -1,141 +1,330 @@
 import os
 import json
 import time
+import asyncio
+import aiohttp
 import argparse
-from google import genai
-from google.genai import types
+from typing import List, Dict, Any
 from dotenv import load_dotenv
 
 load_dotenv()
 
-class GeminiFormatter:
+class AsyncGeminiFormatter:
     def __init__(self, rpm_limit=15):
         self.api_key = os.getenv("GEMINI_API_KEY")
         if not self.api_key or self.api_key == "your_gemini_api_key_here":
             raise ValueError("GEMINI_API_KEY is not set correctly in .env")
         
-        # Initialize new SDK client
-        self.client = genai.Client(api_key=self.api_key)
-        self.model_name = 'gemini-2.0-flash'
-        self.sleep_time = 60.0 / rpm_limit
+        self.model_name = 'gemini-2.5-flash'
+        self.api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.model_name}:generateContent?key={self.api_key}"
+        
+        # Concurrency limit based on RPM (safe for free tier, can be increased for paid)
+        self.semaphore = asyncio.Semaphore(rpm_limit)
+        self.max_chunk_chars = 40000 # Map phase chunk size (Gemini Flash has 1M context, but chunking aids strict extraction)
 
-    def format_text(self, raw_text: str) -> str:
-        # Prevent massive documents from blowing the 1M Token Per Minute free tier quota
-        if len(raw_text) > 30000:
-            print(f"    Warning: Truncating huge text ({len(raw_text)} chars -> 30000)")
-            raw_text = raw_text[:30000] + "\n...[TRUNCATED_TO_SAVE_TOKENS]..."
-            
-        prompt = f"""
-        You are a technical data cleaner preparing text for a Retrieval-Augmented Generation (RAG) system focused on Linux log diagnosis.
-        Below is raw scraped text from a forum, bug tracker, or wiki. 
-        
-        Your task is to:
-        1. Extract the core problem, symptom, or error being discussed.
-        2. Detail the exact steps taken to troubleshoot or fix it.
-        3. Remove non-informative noise (like greetings, signatures, unrelated thread chatter).
-        4. State clearly what worked or the final resolution.
-        
-        Return pure text. Do NOT wrap it in markdown code blocks like ```markdown.
-        
-        Raw Text:
-        {raw_text}
+    def _chunk_text_structure_aware(self, text: str) -> List[str]:
         """
+        Splits massive logs without breaking markdown code blocks or stack traces.
+        """
+        chunks = []
+        current_chunk = []
+        current_length = 0
+        in_code_block = False
+
+        for line in text.split('\n'):
+            if line.startswith('```'):
+                in_code_block = not in_code_block
+
+            line_len = len(line) + 1
+            
+            # If we hit the limit, AND we are not inside a code block, flush the chunk
+            if current_length + line_len > self.max_chunk_chars and not in_code_block:
+                if current_chunk:
+                    chunks.append("\n".join(current_chunk))
+                    current_chunk = []
+                    current_length = 0
+            
+            current_chunk.append(line)
+            current_length += line_len
+
+        # Flush remainder
+        if current_chunk:
+            chunks.append("\n".join(current_chunk))
+
+        return chunks
+
+    def _extract_json(self, text: str) -> str:
+        """Extracts the outermost JSON object or array from a string."""
+        if not text:
+            return ""
+            
+        text = text.strip()
+        start_obj = text.find('{')
+        end_obj = text.rfind('}')
+        start_arr = text.find('[')
+        end_arr = text.rfind(']')
         
-        for attempt in range(3):
+        if start_obj != -1 and end_obj != -1 and (start_arr == -1 or start_obj < start_arr):
+            return text[start_obj:end_obj+1]
+        elif start_arr != -1 and end_arr != -1:
+            return text[start_arr:end_arr+1]
+        return text
+
+    async def _call_llm(self, system_prompt: str, user_prompt: str, attempt: int = 1) -> str:
+        """Async wrapper for Gemini API with backoff."""
+        prompt = f"{system_prompt}\n\n{user_prompt}"
+        
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.1,
+                "responseMimeType": "application/json"
+            }
+        }
+        
+        async with self.semaphore:
             try:
-                response = self.client.models.generate_content(
-                    model=self.model_name,
-                    contents=prompt
-                )
-                time.sleep(self.sleep_time) # Rate limit to stay within RPM
-                if response.text:
-                    return response.text.replace("```markdown", "").replace("```", "").strip()
-                return None
-            except Exception as e:
-                print(f"Error calling Gemini: {e}")
-                # Wait longer on error (e.g., rate limit hit)
-                time.sleep(10 + (attempt * 10))
+                async with aiohttp.ClientSession() as session:
+                    async with session.post(self.api_url, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            
+                            # Navigate Gemini's response structure
+                            if 'candidates' in data and len(data['candidates']) > 0:
+                                candidate = data['candidates'][0]
+                                if 'content' in candidate and 'parts' in candidate['content']:
+                                    parts = candidate['content']['parts']
+                                    if len(parts) > 0 and 'text' in parts[0]:
+                                        return parts[0]['text']
+                            return None
+                        else:
+                            error_text = await response.text()
+                            if response.status in [400, 401, 403]:
+                                print(f"FATAL API ERROR {response.status}: {error_text}")
+                                raise ValueError(f"HTTP {response.status}: {error_text}")
+                            raise RuntimeError(f"HTTP {response.status}: {error_text}")
+                            
+            except BaseException as e:
+                # Catch rate limits or service errors
+                if attempt <= 3 and not isinstance(e, KeyboardInterrupt) and not isinstance(e, ValueError):
+                    print(f"    [~] Rate limit or network error, backing off... (Attempt {attempt}) - {e}")
+                    await asyncio.sleep(4 ** attempt) # Longer exponential backoff for Gemini rate limits
+                    return await self._call_llm(system_prompt, user_prompt, attempt + 1)
                 
+                if isinstance(e, KeyboardInterrupt) or isinstance(e, asyncio.CancelledError):
+                    raise
+                
+                print(f"    [!] Failed LLM call finally: {e}")
+                return None
+
+    async def _map_chunk(self, chunk: str, chunk_index: int) -> Dict[str, Any]:
+        """MAP PHASE: Extract problems and solutions from a single chunk."""
+        system_prompt = "You are a strict, objective data-extraction parser. Your ONLY job is to extract technical troubleshooting data from the provided text chunk. Return ONLY valid JSON."
+        user_prompt = f"""
+CRITICAL RULES:
+1. DO NOT use outside knowledge. 
+2. DO NOT invent, infer, or guess a solution if one is not explicitly stated in the text.
+3. If the text discusses an error but provides no solution, you must explicitly state: "No solution provided in this text chunk."
+4. Preserve exact error codes, file paths, versions, and hardware specs exactly as written.
+
+EXTRACT THE FOLLOWING INTO A JSON OBJECT:
+{{
+  "hardware_or_env": "(STRING: Any hardware, OS, or software versions mentioned)",
+  "problem": "(STRING: A concise summary of the issue being experienced)",
+  "raw_logs": "(STRING: Exact copy-paste of any error messages or terminal outputs. Use \\n for newlines. DO NOT USE AN ARRAY.)",
+  "proposed_solution": "(STRING: What the users explicitly tried or suggested to fix it)"
+}}
+
+TEXT CHUNK TO PROCESS:
+{chunk}
+
+Reply ONLY with the valid JSON object. Do not include any other text or conversational preamble.
+"""
+        result = await self._call_llm(system_prompt, user_prompt)
+        try:
+            if result:
+                clean_json = self._extract_json(result)
+                parsed = json.loads(clean_json)
+                parsed['chunk_index'] = chunk_index
+                return parsed
+        except json.JSONDecodeError:
+            print(f"    [x] Chunk {chunk_index} failed strict JSON mapping")
         return None
 
-    def process_file(self, file_path: str):
-        if not os.path.exists(file_path):
-            print(f"File not found: {file_path}")
+    async def _reduce_chunks(self, mapped_results: List[Dict[str, Any]], original_doc_id: str) -> Dict[str, Any]:
+        """REDUCE PHASE: Synthesize all mapped chunk extractions into a final structured output."""
+        valid_results = [r for r in mapped_results if r]
+        
+        if not valid_results:
+            return None # No useful diagnostic info found across any chunks
+
+        system_prompt = "You are a strict data-merging parser. You are receiving an array of JSON objects representing extracted parts of a single Linux troubleshooting thread. Return ONLY valid JSON."
+        
+        compiled_data = json.dumps(valid_results, indent=2)
+        user_prompt = f"""
+CRITICAL RULES:
+1. Synthesize this array into ONE final, cohesive JSON object.
+2. DO NOT add any outside knowledge. Base your final output strictly on the provided JSON objects.
+3. If multiple solutions were proposed across the chunks, list the one that the users confirmed worked. If unconfirmed, list all proposed steps.
+4. Output MUST be valid JSON, ready to be appended to a JSONL file.
+
+REQUIRED OUTPUT SCHEMA:
+{{
+  "doc_id": "{original_doc_id}",
+  "domain": "(STRING: e.g., 'systemd', 'networking', 'kernel')",
+  "hardware_env": "(STRING: Merged string of relevant specs/versions)",
+  "problem": "(STRING: Cohesive summary of the entire issue)",
+  "raw_logs": "(STRING: Combined critical error strings. Use \\n for newlines. DO NOT USE AN ARRAY.)",
+  "solution": "(STRING: The explicitly stated fix, or 'Unresolved')"
+}}
+
+ARRAY OF EXTRACTED CHUNKS:
+{compiled_data}
+
+Reply ONLY with the valid JSON object. Do not include any other text or conversational preamble.
+"""
+        
+        result = await self._call_llm(system_prompt, user_prompt)
+        try:
+            if result:
+                clean_json = self._extract_json(result)
+                return json.loads(clean_json)
+        except json.JSONDecodeError:
+            pass # Silent fail here, the process_document loop will catch the None return
+        return None
+
+    async def process_document(self, raw_text: str, source_id: str) -> Dict[str, Any]:
+        """Main pipeline: Split -> Map -> Reduce"""
+        chunks = self._chunk_text_structure_aware(raw_text)
+        
+        if len(chunks) == 0:
+            return None
+        
+        # Initialize task
+        if len(chunks) > 1:
+            print(f"    [~] Mapping {len(chunks)} chunk(s)...", end="\r")
+        
+        # MAP concurrently
+        tasks = [self._map_chunk(chunk, i) for i, chunk in enumerate(chunks)]
+        mapped_results = await asyncio.gather(*tasks)
+
+        # REDUCE
+        final_json = await self._reduce_chunks(mapped_results, source_id)
+        return final_json
+
+    async def process_file(self, raw_file_path: str, output_dir: str):
+        if not os.path.exists(raw_file_path):
+            print(f"File not found: {raw_file_path}")
             return
 
-        print(f"\nProcessing file: {file_path}")
-        temp_path = file_path + ".temp"
+        source_name = os.path.basename(raw_file_path).replace('.jsonl', '')
+        processed_file_path = os.path.join(output_dir, f"processed_{source_name}.jsonl")
+        temp_raw_path = raw_file_path + ".temp"
+
+        print(f"\nProcessing {raw_file_path} -> {processed_file_path}")
         
+        # Fast file loading
+        with open(raw_file_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
         processed_count = 0
         skipped_count = 0
-        error_count = 0
 
-        with open(file_path, 'r', encoding='utf-8') as infile, \
-             open(temp_path, 'w', encoding='utf-8') as outfile:
-            
-            for line in infile:
-                if not line.strip(): continue
-                
-                try:
-                    data = json.loads(line)
-                except json.JSONDecodeError:
-                    print("Skipping malformed JSON line.")
-                    continue
-                
-                # Ensure flag gets checked before doing any work
-                if data.get("formatting_done", False) is True:
-                    outfile.write(json.dumps(data) + '\n')
-                    skipped_count += 1
-                    continue
-                
-                # Extract text to format
-                raw_text = ""
-                if 'messages' in data: # SFT Format (StackExchange)
-                    raw_text = "\n".join([f"{m['role']}: {m['content']}" for m in data['messages']])
-                elif 'text' in data:   # Raw Format (GitHub/Wiki)
-                    raw_text = data['text']
-                
-                if not raw_text:
-                    outfile.write(json.dumps(data) + '\n')
-                    continue
-
-                formatted_text = self.format_text(raw_text)
-                
-                if formatted_text:
-                    # Replace with cleaned text and set the flag
-                    if 'messages' in data:
-                        data['text'] = formatted_text # Standardize on 'text'
-                        del data['messages']
-                    elif 'text' in data:
-                        data['text'] = formatted_text
-                        
-                    data['formatting_done'] = True
-                    outfile.write(json.dumps(data) + '\n')
-                    processed_count += 1
-                    print(f"  [{processed_count}] Formatted document from source: {data.get('source', 'unknown')}")
-                else:
-                    # Write original if formatting failed so we don't drop data
-                    outfile.write(json.dumps(data) + '\n')
-                    error_count += 1
-
-        # Replace original file safely
+        last_processed_idx = -1
         try:
-            os.replace(temp_path, file_path)
-            print(f"Finished {file_path} -> Formatted: {processed_count} | Skipped (already done): {skipped_count} | Errors: {error_count}")
-        except Exception as e:
-            print(f"Could not overwrite {file_path}. Data saved to {temp_path}. Error: {e}")
+            # We open the destination in append mode to incrementally save
+            with open(processed_file_path, 'a', encoding='utf-8') as out_f, \
+                 open(temp_raw_path, 'w', encoding='utf-8') as raw_out_f:
+                
+                for i, line in enumerate(lines):
+                    last_processed_idx = i
+                    if not line.strip(): continue
+                    
+                    try:
+                        data = json.loads(line)
+                    except json.JSONDecodeError:
+                        raw_out_f.write(line)
+                        continue
+                    
+                    # Idempotency check 
+                    if data.get("formatting_done", False):
+                        raw_out_f.write(json.dumps(data) + '\n')
+                        skipped_count += 1
+                        continue
 
-if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Clean and structure JSONL training data using Gemini (No Vector DB insertion).")
-    parser.add_argument("--directory", default=os.path.join("data", "training"), help="Directory containing JSONL files")
-    parser.add_argument("--rpm", type=int, default=15, help="Requests per minute (15 = free tier safe)")
+                    # Extract raw text depending on schema
+                    raw_text = ""
+                    if 'messages' in data: 
+                        raw_text = "\n".join([f"{m['role']}: {m['content']}" for m in data['messages']])
+                    elif 'text' in data:   
+                        raw_text = data['text']
+
+                    if not raw_text:
+                        raw_out_f.write(json.dumps(data) + '\n')
+                        continue
+
+                    # Execute Map-Reduce via Gemini
+                    source_id = data.get('source', 'unknown')
+                    final_structured = await self.process_document(raw_text, source_id)
+                    
+                    if final_structured:
+                        # Add metadata
+                        final_structured['source_file'] = raw_file_path
+                        final_structured['original_link'] = data.get('source', '')
+                        
+                        # Append to processed file
+                        out_f.write(json.dumps(final_structured) + '\n')
+                        out_f.flush() # Ensure it hits disk immediately
+                        
+                        # Mark raw file as done
+                        data['formatting_done'] = True
+                        processed_count += 1
+                        print(f"  [✓] Processed: {data.get('source', 'unknown')} | Total: {processed_count}")
+                    else:
+                        print(f"  [x] Failed extraction: {data.get('source', 'unknown')}")
+                    
+                    # Save the raw row (either flagged true, or false if it failed so we retry later)
+                    raw_out_f.write(json.dumps(data) + '\n')
+        except BaseException as e:
+            if isinstance(e, KeyboardInterrupt) or isinstance(e, asyncio.CancelledError):
+                print("\n[!] Script interrupted. Gracefully saving progress...")
+            else:
+                print(f"\n[!] Unexpected Error. Gracefully saving progress... {e}")
+            raise
+        finally:
+            # Safely write all remaining unprocessed lines to the temp file so they aren't lost
+            with open(temp_raw_path, 'a', encoding='utf-8') as raw_out_f:
+                for remaining_line in lines[last_processed_idx + 1:]:
+                    if remaining_line.strip():
+                        raw_out_f.write(remaining_line)
+                        if not remaining_line.endswith('\n'):
+                            raw_out_f.write('\n')
+            
+            # Atomic replacement of the raw file to save the formatting_done flags
+            os.replace(temp_raw_path, raw_file_path)
+
+        print(f"Finished {source_name} | Mapped/Reduced: {processed_count} | Skipped: {skipped_count}")
+
+async def main():
+    parser = argparse.ArgumentParser(description="Async Map-Reduce JSONL Formatter for Gemini 3.0 Flash.")
+    parser.add_argument("--directory", default=os.path.join("data", "training"), help="Input directory")
+    parser.add_argument("--output", default=os.path.join("data", "processed"), help="Output directory")
+    parser.add_argument("--rpm", type=int, default=15, help="Requests per minute (concurrency limit)")
     args = parser.parse_args()
 
-    formatter = GeminiFormatter(rpm_limit=args.rpm)
+    os.makedirs(args.output, exist_ok=True)
+    formatter = AsyncGeminiFormatter(rpm_limit=args.rpm)
     
     if os.path.exists(args.directory):
         for file in os.listdir(args.directory):
-            if file.endswith(".jsonl"):
-                formatter.process_file(os.path.join(args.directory, file))
+            if file.endswith(".jsonl") and not file.startswith("processed_"):
+                await formatter.process_file(os.path.join(args.directory, file), args.output)
     else:
         print(f"Directory {args.directory} does not exist.")
+
+if __name__ == "__main__":
+    # Windows asyncio fix for ProactorEventLoop
+    if os.name == 'nt':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
+    asyncio.run(main())
