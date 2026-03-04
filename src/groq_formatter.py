@@ -19,9 +19,11 @@ class AsyncGroqFormatter:
         self.model_name = 'llama-3.3-70b-versatile'
         self.api_url = "https://api.groq.com/openai/v1/chat/completions"
         
-        # Concurrency limit based on RPM
-        self.semaphore = asyncio.Semaphore(rpm_limit)
-        self.max_chunk_chars = 8000 # Map phase chunk size (drastically lowered to avoid massive TPM Groq spikes)
+        # Enforce a strict time pacing between requests instead of burst concurrency
+        self.rpm_limit = rpm_limit
+        self.pacing_lock = asyncio.Lock()
+        self.last_api_call = 0.0
+        self.max_chunk_chars = 5000 # Map phase chunk size (lowered to drastically reduce TPM spikes)
 
     def _chunk_text_structure_aware(self, text: str) -> List[str]:
         """
@@ -89,47 +91,57 @@ class AsyncGroqFormatter:
             "response_format": {"type": "json_object"}
         }
         
-        async with self.semaphore:
-            try:
-                async with aiohttp.ClientSession() as session:
-                    async with session.post(self.api_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
-                        if response.status == 200:
-                            data = await response.json()
-                            if 'choices' in data and len(data['choices']) > 0:
-                                return data['choices'][0]['message']['content']
-                            return None
-                        else:
-                            error_text = await response.text()
-                            if response.status in [400, 401, 403]:
-                                print(f"FATAL API ERROR {response.status}: {error_text}")
-                                raise ValueError(f"HTTP {response.status}: {error_text}")
-                            raise RuntimeError(f"HTTP {response.status}: {error_text}")
-                            
-            except BaseException as e:
-                # Catch rate limits or service errors
-                if attempt <= 10 and not isinstance(e, KeyboardInterrupt) and not isinstance(e, ValueError):
-                    wait_time = 8 ** attempt
-                    
-                    # If this is our manual RuntimeError 429 from Groq
-                    if isinstance(e, RuntimeError) and "429" in str(e):
-                        # Try to parse the explicit wait time
-                        match = re.search(r"Please try again in (\d+\.?\d*)s", str(e))
-                        if match:
-                            wait_time = float(match.group(1)) + 1.0 # Buffer safely
-                            print(f"    [~] Rate limit hit. Groq requested we wait {wait_time:.2f}s... (Attempt {attempt})")
-                        else:
-                            print(f"    [~] Rate limit hit, backing off via formula... (Attempt {attempt})")
+        # Pacing lock to prevent bursting that triggers TPM (Token Per Minute) bans
+        async with self.pacing_lock:
+            now = time.time()
+            elapsed = now - self.last_api_call
+            delay = (60.0 / self.rpm_limit) - elapsed
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self.last_api_call = time.time()
+            
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(self.api_url, headers=headers, json=payload, timeout=aiohttp.ClientTimeout(total=60)) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if 'choices' in data and len(data['choices']) > 0:
+                            return data['choices'][0]['message']['content']
+                        return None
                     else:
-                        print(f"    [~] Network/API error, backing off... (Attempt {attempt}) - {type(e).__name__}")
-                    
-                    await asyncio.sleep(wait_time) 
-                    return await self._call_llm(system_prompt, user_prompt, attempt + 1)
+                        error_text = await response.text()
+                        if response.status in [400, 401, 403]:
+                            print(f"FATAL API ERROR {response.status}: {error_text}")
+                            raise ValueError(f"HTTP {response.status}: {error_text}")
+                        raise RuntimeError(f"HTTP {response.status}: {error_text}")
+                        
+        except BaseException as e:
+            # Catch rate limits or service errors
+            if attempt <= 15 and not isinstance(e, KeyboardInterrupt) and not isinstance(e, ValueError):
+                wait_time = 4 * attempt # Much safer fallback: 4s, 8s, 12s...
                 
-                if isinstance(e, KeyboardInterrupt) or isinstance(e, asyncio.CancelledError):
-                    raise
+                # If this is our manual RuntimeError 429 from Groq
+                if isinstance(e, RuntimeError) and "429" in str(e):
+                    # Try to parse the explicit wait time. Groq occasionally sends formats like '1m20.352s'
+                    match = re.search(r"Please try again in (?:(\d+)m)?(\d+\.?\d*)s", str(e))
+                    if match:
+                        mins = float(match.group(1)) if match.group(1) else 0.0
+                        secs = float(match.group(2))
+                        wait_time = (mins * 60.0) + secs + 1.0 # Buffer safely
+                        print(f"    [~] Rate limit hit. Groq requested we wait {wait_time:.2f}s... (Attempt {attempt})")
+                    else:
+                        print(f"    [~] Rate limit hit, backing off via formula... (Attempt {attempt})")
+                else:
+                    print(f"    [~] Network/API error, backing off... (Attempt {attempt}) - {type(e).__name__}")
                 
-                print(f"    [!] Failed LLM call finally: {e}")
-                return None
+                await asyncio.sleep(wait_time) 
+                return await self._call_llm(system_prompt, user_prompt, attempt + 1)
+            
+            if isinstance(e, KeyboardInterrupt) or isinstance(e, asyncio.CancelledError):
+                raise
+            
+            print(f"    [!] Failed LLM call finally: {e}")
+            return None
 
     async def _map_chunk(self, chunk: str, chunk_index: int) -> Dict[str, Any]:
         """MAP PHASE: Extract problems and solutions from a single chunk."""
