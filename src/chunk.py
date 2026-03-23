@@ -1,6 +1,6 @@
 from typing import List
 
-def chunk_text(text: str, chunk_size: int = 500, chunk_overlap: int = 50) -> List[str]:
+def chunk_text(text: str, chunk_size: int = 4000, chunk_overlap: int = 400) -> List[str]:
     """
     Splits text into chunks of specified size with overlap.
     """

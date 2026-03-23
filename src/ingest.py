@@ -35,7 +35,7 @@ except ImportError as e:
     class Deduplicator: 
         def deduplicate_documents(self, docs): return docs
 
-def load_documents(source_path: str = None, source_type: str = 'local', limit: int = 10) -> List[Dict[str, str]]:
+def load_documents(source_path: str = None, source_type: str = 'local', limit: int = 10, skip_dedup: bool = False) -> List[Dict[str, str]]:
     """
     Loads text documents from a directory or scraper.
     """
@@ -86,6 +86,24 @@ def load_documents(source_path: str = None, source_type: str = 'local', limit: i
                                             'content': content,
                                             'metadata': {'source': file_path, 'type': data.get('source', 'jsonl_sft')}
                                         })
+                                # Handle RAG-Extracted schema (Our local/groq/normal formatters)
+                                elif 'problem' in data and 'solution' in data:
+                                    parts = []
+                                    if data.get('domain'): parts.append(f"Domain: {data['domain']}")
+                                    if data.get('hardware_env'): parts.append(f"Environment: {data['hardware_env']}")
+                                    parts.append(f"Problem:\n{data['problem']}")
+                                    if data.get('raw_logs'): parts.append(f"Logs:\n{data['raw_logs']}")
+                                    parts.append(f"Solution:\n{data['solution']}")
+                                    
+                                    content = "\n\n".join(parts)
+                                    documents.append({
+                                        'content': content,
+                                        'metadata': {
+                                            'source': file_path, 
+                                            'type': 'rag_extracted',
+                                            'doc_id': data.get('doc_id', '')
+                                        }
+                                    })
                                 # Handle Raw Pre-training format
                                 elif 'text' in data:
                                     documents.append({
@@ -144,7 +162,11 @@ def load_documents(source_path: str = None, source_type: str = 'local', limit: i
                 'metadata': {'source': item['source'], 'title': item['title'], 'type': 'web_page'}
             })
 
-    # Deduplication
+    # Deduplication (skip for pre-processed JSONL — that data is already curated)
+    if skip_dedup or source_type == 'jsonl':
+        print(f"Total documents loaded: {len(documents)} (deduplication skipped for pre-processed data)")
+        return documents
+
     print(f"Total documents before deduplication: {len(documents)}")
     deduper = Deduplicator()
     unique_documents = deduper.deduplicate_documents(documents)
