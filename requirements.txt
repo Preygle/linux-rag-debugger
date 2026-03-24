@@ -9,3 +9,5 @@ beautifulsoup4
 stackapi
 PyGithub
 lxml
+flask
+python-dotenv

@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Linux RAG Debugger</title>
+  <meta name="description"
+    content="AI-powered Linux log diagnosis and troubleshooting assistant powered by local RAG." />
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link
+    href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+    rel="stylesheet" />
+
+  <!-- Lucide icons -->
+  <script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+
+  <!-- Highlight.js -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github-dark.min.css" />
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/highlight.min.js"></script>
+
+  <!-- Marked.js -->
+  <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+
+<body>
+  <!-- Sidebar -->
+  <aside class="sidebar" id="sidebar">
+    <div class="sidebar-header">
+      <div class="logo">
+        <img src="/static/logo.png" alt="Linux RAG Debugger Logo" class="logo-img" />
+        <div class="logo-text">
+          <h1>Linux RAG</h1>
+          <span>Debugger</span>
+        </div>
+      </div>
+      <button class="new-chat-btn" id="newChatBtn" title="New Chat">
+        <i data-lucide="plus" class="icon-sm"></i>
+        New Chat
+      </button>
+    </div>
+
+    <div class="chat-history" id="chatHistory">
+      <p class="history-label">Recent</p>
+    </div>
+
+    <div class="sidebar-footer">
+      <div class="model-badge">
+        <div class="model-dot"></div>
+        <div class="model-info">
+          <span class="model-label">Embed</span>
+          <span class="model-name">BGE-M3 Q8</span>
+        </div>
+      </div>
+      <div class="model-badge">
+        <div class="model-dot model-dot--green"></div>
+        <div class="model-info">
+          <span class="model-label">LLM</span>
+          <span class="model-name">Llama 3.1 8B</span>
+        </div>
+      </div>
+    </div>
+  </aside>
+
+  <!-- Main -->
+  <main class="main" id="main">
+    <button class="sidebar-toggle" id="sidebarToggle" aria-label="Toggle sidebar">
+      <i data-lucide="menu" class="icon-sm"></i>
+    </button>
+
+    <!-- Welcome screen -->
+    <div class="welcome" id="welcome">
+      <div class="welcome-icon-wrapper">
+        <img src="/static/logo.png" alt="Logo" class="welcome-logo" />
+      </div>
+      <h2>Linux Log Diagnosis</h2>
+      <p>Paste a log snippet, error message, or describe your Linux issue. The RAG system retrieves relevant knowledge
+        and diagnoses the root cause.</p>
+      <div class="suggestions">
+        <button class="suggestion-chip" data-query="kernel panic VFS unable to mount root fs on boot">
+          <i data-lucide="cpu" class="icon-xs"></i> kernel panic on boot
+        </button>
+        <button class="suggestion-chip" data-query="systemd service fails to start after system upgrade">
+          <i data-lucide="settings" class="icon-xs"></i> systemd service failure
+        </button>
+        <button class="suggestion-chip" data-query="error while loading shared libraries libssl.so not found">
+          <i data-lucide="link-2-off" class="icon-xs"></i> shared library missing
+        </button>
+        <button class="suggestion-chip" data-query="network interface not showing up after reboot">
+          <i data-lucide="wifi-off" class="icon-xs"></i> network interface missing
+        </button>
+      </div>
+    </div>
+
+    <!-- Chat messages -->
+    <div class="messages" id="messages"></div>
+
+    <!-- Input bar -->
+    <div class="input-area">
+      <div class="input-wrapper">
+        <textarea id="userInput" placeholder="Paste a Linux log, error message, or describe your issue..." rows="1"
+          aria-label="Chat input"></textarea>
+        <button class="send-btn" id="sendBtn" aria-label="Send message" disabled>
+          <i data-lucide="send" class="icon-sm"></i>
+        </button>
+      </div>
+      <p class="input-hint">Enter to send &nbsp;&bull;&nbsp; Shift+Enter for new line &nbsp;&bull;&nbsp; Powered by
+        local LM Studio</p>
+    </div>
+  </main>
+
+  <!-- Avatar SVG templates (hidden, cloned by JS) -->
+  <div style="display:none">
+    <svg id="svg-user-avatar" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2" />
+      <circle cx="12" cy="7" r="4" />
+    </svg>
+    <svg id="svg-ai-avatar" xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none"
+      stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect width="18" height="11" x="3" y="11" rx="2" ry="2" />
+      <path d="M7 11V7a5 5 0 0 1 10 0v4" />
+      <line x1="8" x2="8" y1="15" y2="17" />
+      <line x1="16" x2="16" y1="15" y2="17" />
+    </svg>
+  </div>
+
+  <script>
+    // Initialize Lucide icons after DOM ready
+    document.addEventListener('DOMContentLoaded', () => lucide.createIcons());
+  </script>
+  <script src="/static/app.js"></script>
+</body>
+
+</html>

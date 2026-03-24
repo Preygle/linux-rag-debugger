@@ -1,6 +1,7 @@
 import os
+import json
 import requests
-from typing import Optional
+from typing import Optional, Generator
 
 LM_STUDIO_BASE_URL = os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1")
 LM_STUDIO_CHAT_MODEL = os.getenv(
@@ -81,8 +82,63 @@ class LLMClient:
             return f"[LLMClient] Error communicating with Ollama: {e}"
 
 
+    def stream_generate(self, prompt: str) -> Generator[str, None, None]:
+        """
+        Yields text chunks in real-time from LM Studio's streaming API.
+        Only supported for 'lmstudio' and 'openai' providers.
+        """
+        if self.provider not in ("lmstudio", "openai"):
+            # Fallback: yield the whole response at once
+            yield self.generate(prompt)
+            return
+
+        url = f"{self.base_url.rstrip('/')}/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        payload = {
+            "model": self.model_name,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.3,
+            "stream": True,
+        }
+
+        try:
+            with requests.post(
+                url, headers=headers, json=payload,
+                stream=True, timeout=300
+            ) as resp:
+                resp.raise_for_status()
+                for raw_line in resp.iter_lines():
+                    if not raw_line:
+                        continue
+                    line = raw_line.decode("utf-8") if isinstance(raw_line, bytes) else raw_line
+                    if not line.startswith("data: "):
+                        continue
+                    payload_str = line[6:].strip()
+                    if payload_str == "[DONE]":
+                        break
+                    try:
+                        chunk = json.loads(payload_str)
+                        delta = chunk["choices"][0]["delta"].get("content", "")
+                        if delta:
+                            yield delta
+                    except (json.JSONDecodeError, KeyError, IndexError):
+                        continue
+        except requests.exceptions.ConnectionError:
+            yield (
+                f"[LLMClient] Cannot connect to {self.provider} at {self.base_url}. "
+                "Make sure LM Studio is running and the model is loaded."
+            )
+        except requests.exceptions.RequestException as e:
+            yield f"[LLMClient] Request failed: {e}"
+
+
 if __name__ == "__main__":
     client = LLMClient(provider="lmstudio")
     print(f"Using model: {client.model_name}")
-    reply = client.generate("What is a kernel panic in Linux? Answer in 2 sentences.")
-    print(reply)
+    print("Streaming: ", end="", flush=True)
+    for chunk in client.stream_generate("What is a kernel panic? Answer in 2 sentences."):
+        print(chunk, end="", flush=True)
+    print()

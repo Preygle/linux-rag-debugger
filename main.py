@@ -143,8 +143,8 @@ def main():
     # Query command
     query_parser = subparsers.add_parser("query", help="Query the RAG system")
     query_parser.add_argument("text", help="Query text or log")
-    query_parser.add_argument("--provider", choices=['ollama', 'openai'], default='ollama', help="LLM Provider")
-    query_parser.add_argument("--model", default='llama2', help="LLM Model Name (e.g., llama2, gpt-3.5-turbo)")
+    query_parser.add_argument("--provider", choices=['ollama', 'openai', 'lmstudio'], default='lmstudio', help="LLM Provider")
+    query_parser.add_argument("--model", default=None, help="LLM Model Name (overrides .env default)")
     
     args = parser.parse_args()
     
