@@ -19,7 +19,7 @@ class VectorStore:
         self.collection = self.client.get_or_create_collection(name=collection_name)
         # print(f"Vector store initialized at {persist_directory}, collection: {collection_name}")
 
-    def add_documents(self, documents: List[str], metadatas: Optional[List[Dict[str, Any]]] = None, ids: Optional[List[str]] = None, embeddings: Optional[List[List[float]]] = None, batch_size: int = 2000):
+    def add_documents(self, documents: List[str], metadatas: Optional[List[Dict[str, Any]]] = None, ids: Optional[List[str]] = None, embeddings: Optional[List[List[float]]] = None, batch_size: int = 1000):
         """
         Adds documents to the vector store in batches to avoid ChromaDB's 5461-item hard limit.
         """

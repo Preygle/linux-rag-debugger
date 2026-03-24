@@ -42,7 +42,7 @@ class Embedder:
         except Exception as e:
             raise RuntimeError(f"[Embedder] Embedding request failed: {e}")
 
-    def embed_documents(self, documents: List[str], batch_size: int = 8) -> List[List[float]]:
+    def embed_documents(self, documents: List[str], batch_size: int = 20) -> List[List[float]]:
         """
         Generate embeddings for a list of documents, batched for efficiency.
         """
