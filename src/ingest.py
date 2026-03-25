@@ -12,28 +12,66 @@ if project_root not in sys.path:
     sys.path.append(project_root)
 
 # Try imports with explicit error handling
-try:
-    # Try importing as if running from project root (e.g. python main.py)
-    # This expects src to be a package or in path
-    try:
-        from src.scrapers.stack_exchange import StackExchangeScraper
-        from src.scrapers.github import GitHubScraper
-        from src.scrapers.web_crawler import WebCrawler
-        from src.dedup import Deduplicator
-    except ImportError:
-        # Fallback if src is in path but not as a top-level package (e.g. python src/ingest.py)
-        from scrapers.stack_exchange import StackExchangeScraper
-        from scrapers.github import GitHubScraper
-        from scrapers.web_crawler import WebCrawler
-        from dedup import Deduplicator
-except ImportError as e:
-    print(f"CRITICAL: Failed to import scraper or dedup modules: {e}")
-    # Define dummy classes to prevent NameError if imports fail
-    class StackExchangeScraper: pass
-    class GitHubScraper: pass
-    class WebCrawler: pass
-    class Deduplicator: 
-        def deduplicate_documents(self, docs): return docs
+def _try_import_scrapers():
+    """
+    Try to import scrapers from both possible path roots and return a dict of
+    callables.  Each import is isolated so a failure in one scraper doesn't
+    shadow the others.
+    """
+    scrapers = {}
+
+    # Determine the two candidate import prefixes.
+    prefixes = ["src.scrapers", "scrapers"]
+
+    for name, attr in [
+        ("StackExchangeScraper", ("stack_exchange", "StackExchangeScraper")),
+        ("GitHubScraper",        ("github",          "GitHubScraper")),
+        ("WebCrawler",           ("web_crawler",     "WebCrawler")),
+        ("scrape_bugzilla",      ("bugzilla_kernel", "scrape")),
+        ("scrape_lkml",          ("lkml",            "scrape")),
+        ("scrape_forums",        ("forums",          "scrape")),
+        ("scrape_nvd",           ("security",        "scrape_nvd")),
+        ("scrape_syzkaller",     ("security",        "scrape_syzkaller")),
+    ]:
+        module_suffix, attr_name = attr
+        for prefix in prefixes:
+            try:
+                import importlib
+                mod = importlib.import_module(f"{prefix}.{module_suffix}")
+                scrapers[name] = getattr(mod, attr_name)
+                break
+            except (ImportError, AttributeError):
+                continue
+        if name not in scrapers:
+            print(f"WARNING: Could not import {name} from any known path.")
+
+    return scrapers
+
+_SCRAPERS = _try_import_scrapers()
+
+StackExchangeScraper = _SCRAPERS.get("StackExchangeScraper", type("StackExchangeScraper", (), {}))
+GitHubScraper        = _SCRAPERS.get("GitHubScraper",        type("GitHubScraper",        (), {}))
+WebCrawler           = _SCRAPERS.get("WebCrawler",           type("WebCrawler",           (), {}))
+
+def scrape_bugzilla(*a, **kw):
+    fn = _SCRAPERS.get("scrape_bugzilla")
+    return fn(*a, **kw) if fn else []
+
+def scrape_lkml(*a, **kw):
+    fn = _SCRAPERS.get("scrape_lkml")
+    return fn(*a, **kw) if fn else []
+
+def scrape_forums(*a, **kw):
+    fn = _SCRAPERS.get("scrape_forums")
+    return fn(*a, **kw) if fn else []
+
+def scrape_nvd(*a, **kw):
+    fn = _SCRAPERS.get("scrape_nvd")
+    return fn(*a, **kw) if fn else []
+
+def scrape_syzkaller(*a, **kw):
+    fn = _SCRAPERS.get("scrape_syzkaller")
+    return fn(*a, **kw) if fn else []
 
 def load_documents(source_path: str = None, source_type: str = 'local', limit: int = 10, skip_dedup: bool = False) -> List[Dict[str, str]]:
     """
@@ -162,6 +200,73 @@ def load_documents(source_path: str = None, source_type: str = 'local', limit: i
                 'metadata': {'source': item['source'], 'title': item['title'], 'type': 'web_page'}
             })
 
+    # EXPERT SCRAPERS
+    elif source_type == 'bugzilla':
+        print(f"Scraping Kernel Bugzilla (limit {limit})")
+        for doc in scrape_bugzilla(max_bugs=limit):
+            sys.stdout.write(f"\rFetched {len(documents)+1} Bugzilla docs...")
+            sys.stdout.flush()
+            doc_dict = json.loads(doc.to_jsonl())
+            content = f"Domain: {doc_dict.get('domain', '')}\nProblem:\n{doc.problem}\n\nLogs:\n{doc.raw_logs}\n\nDebug Steps:\n{doc.debug_steps}\n\nRoot Cause:\n{doc.root_cause}\n\nSolution:\n{doc.solution}\n\nReasoning:\n{doc.reasoning}"
+            documents.append({
+                'content': content,
+                'metadata': {'source': doc.link, 'type': 'bugzilla', 'doc_id': doc.doc_id, 'failure_type': doc.failure_type}
+            })
+        print()
+
+    elif source_type == 'lkml':
+        print(f"Scraping LKML (limit {limit})")
+        for doc in scrape_lkml(max_total=limit):
+            sys.stdout.write(f"\rFetched {len(documents)+1} LKML threads...")
+            sys.stdout.flush()
+            doc_dict = json.loads(doc.to_jsonl())
+            content = f"Domain: {doc_dict.get('domain', '')}\nProblem:\n{doc.problem}\n\nLogs:\n{doc.raw_logs}\n\nDebug Steps:\n{doc.debug_steps}\n\nRoot Cause:\n{doc.root_cause}\n\nSolution:\n{doc.solution}\n\nReasoning:\n{doc.reasoning}"
+            documents.append({
+                'content': content,
+                'metadata': {'source': doc.link, 'type': 'lkml', 'doc_id': doc.doc_id, 'failure_type': doc.failure_type}
+            })
+        print()
+
+    elif source_type == 'forums':
+        print(f"Scraping Forums (limit {limit})")
+        for doc in scrape_forums(max_docs=limit):
+            sys.stdout.write(f"\rFetched {len(documents)+1} Forum posts...")
+            sys.stdout.flush()
+            doc_dict = json.loads(doc.to_jsonl())
+            content = f"Domain: {doc_dict.get('domain', '')}\nProblem:\n{doc.problem}\n\nLogs:\n{doc.raw_logs}\n\nDebug Steps:\n{doc.debug_steps}\n\nRoot Cause:\n{doc.root_cause}\n\nSolution:\n{doc.solution}\n\nReasoning:\n{doc.reasoning}"
+            documents.append({
+                'content': content,
+                'metadata': {'source': doc.link, 'type': 'forums', 'doc_id': doc.doc_id, 'failure_type': doc.failure_type}
+            })
+        print()
+
+    elif source_type == 'nvd':
+        print(f"Scraping NVD CVE Database (limit {limit})")
+        api_key = os.getenv("NVD_API_KEY")
+        for doc in scrape_nvd(max_docs=limit, api_key=api_key):
+            sys.stdout.write(f"\rFetched {len(documents)+1} CVE records...")
+            sys.stdout.flush()
+            doc_dict = json.loads(doc.to_jsonl())
+            content = f"Domain: {doc_dict.get('domain', '')}\nProblem:\n{doc.problem}\n\nLogs:\n{doc.raw_logs}\n\nDebug Steps:\n{doc.debug_steps}\n\nRoot Cause:\n{doc.root_cause}\n\nSolution:\n{doc.solution}\n\nReasoning:\n{doc.reasoning}"
+            documents.append({
+                'content': content,
+                'metadata': {'source': doc.link, 'type': 'nvd', 'doc_id': doc.doc_id, 'failure_type': doc.failure_type}
+            })
+        print()
+
+    elif source_type == 'syzkaller':
+        print(f"Scraping Syzbot Crash Repository (limit {limit})")
+        for doc in scrape_syzkaller(max_docs=limit):
+            sys.stdout.write(f"\rFetched {len(documents)+1} Syzbot crashes...")
+            sys.stdout.flush()
+            doc_dict = json.loads(doc.to_jsonl())
+            content = f"Domain: {doc_dict.get('domain', '')}\nProblem:\n{doc.problem}\n\nLogs:\n{doc.raw_logs}\n\nDebug Steps:\n{doc.debug_steps}\n\nRoot Cause:\n{doc.root_cause}\n\nSolution:\n{doc.solution}\n\nReasoning:\n{doc.reasoning}"
+            documents.append({
+                'content': content,
+                'metadata': {'source': doc.link, 'type': 'syzkaller', 'doc_id': doc.doc_id, 'failure_type': doc.failure_type}
+            })
+        print()
+
     # Deduplication (skip for pre-processed JSONL — that data is already curated)
     if skip_dedup or source_type == 'jsonl':
         print(f"Total documents loaded: {len(documents)} (deduplication skipped for pre-processed data)")
@@ -174,7 +279,15 @@ def load_documents(source_path: str = None, source_type: str = 'local', limit: i
 
     return unique_documents
 
-if __name__ == "__main__":
-    # Test
+try:
+    from src.dedup import Deduplicator
+except ImportError:
+    try:
+        from dedup import Deduplicator
+    except ImportError:
+        print("WARNING: Could not import Deduplicator.")
+        class Deduplicator:
+            def deduplicate_documents(self, docs): return docs
+if __name__ == '__main__':
     docs = load_documents(source_type='stackexchange', limit=2)
-    print(f"Loaded {len(docs)} documents.")
+    print(f'Loaded {len(docs)} documents.')
