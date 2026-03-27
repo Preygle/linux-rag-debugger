@@ -94,14 +94,14 @@ def extract_all(output_dir):
     """
     # 95% of max daily limits
     LIMITS = {
-        'stackexchange': 9500,
-        'github': 950,
-        'web': 950,
-        'bugzilla': 200,
-        'lkml': 300,
-        'forums': 200,
-        'nvd': 200,
-        'syzkaller': 150
+        'bugzilla': 57600,
+        'lkml': 43200,
+        'forums': 43200,
+        'nvd': 144000,
+        'syzkaller': 57600,
+        'stackexchange': 10000,
+        'github': 5000,
+        'web': 5000,
     }
 
     os.makedirs(output_dir, exist_ok=True)

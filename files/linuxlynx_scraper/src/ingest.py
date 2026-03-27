@@ -5,19 +5,11 @@ from typing import List, Dict
 
 import sys
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    load_dotenv = None
-
 # Ensure project root is in sys.path
 current_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(current_dir)
 if project_root not in sys.path:
     sys.path.append(project_root)
-
-if load_dotenv is not None:
-    load_dotenv(os.path.join(project_root, ".env"))
 
 # Try imports with explicit error handling
 def _try_import_scrapers():
@@ -283,11 +275,6 @@ def load_documents(source_path: str = None, source_type: str = 'local', limit: i
     print(f"Total documents before deduplication: {len(documents)}")
     deduper = Deduplicator()
     unique_documents = deduper.deduplicate_documents(documents)
-    if documents and not unique_documents:
-        print(
-            "All fetched documents were already present in the persistent dedup store "
-            f"({deduper.hash_file})."
-        )
     print(f"Total documents after deduplication: {len(unique_documents)}")
 
     return unique_documents

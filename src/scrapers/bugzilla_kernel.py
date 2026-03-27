@@ -1,346 +1,390 @@
 """
-Kernel Bugzilla scraper  —  https://bugzilla.kernel.org/
-Targets confirmed-fixed bugs (RESOLVED FIXED) with logs attached.
+Linux Bugzilla scraper
+======================
 
-Filtering:
-  - Status: RESOLVED, VERIFIED
-  - Resolution: FIXED
-  - Has at least one comment with a patch URL, commit hash, or fix description
-  - raw_logs >= 50 chars
+The original kernel Bugzilla scraper targeted https://bugzilla.kernel.org/,
+but that site is now fronted by an Anubis proof-of-work challenge that blocks
+plain HTTP clients. This scraper switches to bugzilla.suse.com, which exposes
+an accessible REST API with recent Linux distro/kernel bugs and comments.
+
+Only resolved/fixed bugs are emitted, and each document requires enough
+problem detail plus a resolution comment so the resulting RAG corpus remains
+useful for troubleshooting.
 """
 
 from __future__ import annotations
+
+import logging
 import re
 import time
-import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Generator
 
 import requests
-from bs4 import BeautifulSoup
 
-# project-local
-import sys, os
+import sys
+import os
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
-from src.schema import (
-    LinuxLynxDoc, extract_distro, extract_kernel,
-    extract_component, classify_risk,
-)
+
+from src.schema import LinuxLynxDoc, extract_component, extract_distro, extract_kernel
 
 log = logging.getLogger(__name__)
 
-BASE      = "https://bugzilla.kernel.org"
+BASE = "https://bugzilla.suse.com"
 REST_BASE = f"{BASE}/rest"
-
-# Kernel Bugzilla REST API v1
 SEARCH_URL = f"{REST_BASE}/bug"
 
-# How many bugs to fetch per API page
 PAGE_LIMIT = 50
-
-# Maximum bugs to scrape per run (set None for unlimited)
 MAX_BUGS = 200
+MAX_WORKERS = 8
+PAGE_DELAY_SECONDS = 0.25
 
-# Rate limiting — be polite
-DELAY_SECONDS = 1.5
+PRODUCTS = [
+    "openSUSE Tumbleweed",
+    "openSUSE Distribution",
+    "SUSE Linux Enterprise Server 15-SP6",
+    "SUSE Linux Enterprise Server 15-SP5",
+    "SUSE Linux Enterprise Desktop 15-SP6",
+    "SUSE Linux Enterprise Desktop 15-SP5",
+]
+
+SEARCH_KEYWORDS = [
+    "kernel panic",
+    "systemd",
+    "network",
+    "ext4",
+    "btrfs",
+    "grub",
+    "selinux",
+    "permission denied",
+    "boot failure",
+    "kdump",
+    "dracut",
+    "ssh",
+]
 
 HEADERS = {
     "User-Agent": (
-        "LinuxLynx-DataCollector/1.0 "
+        "LinuxLynx-DataCollector/2.0 "
         "(research dataset; contact: dataset@linuxlynx.dev)"
     )
 }
 
-_COMMIT_RE = re.compile(
-    r"(?:commit|fix(?:ed)?\s+in|patch)[:\s]+([0-9a-f]{7,40})", re.IGNORECASE
+_FIX_RE = re.compile(
+    r"(?:fix(?:ed)?|resolved|works now|updated kernel|kernel update|closed|"
+    r"patch(?:ed)?|commit|backport)",
+    re.IGNORECASE,
 )
-_PATCH_RE = re.compile(r"https?://(?:lore\.kernel\.org|patchwork\.|git\.kernel\.org)\S+")
-_VERSION_RE = re.compile(r"\b(\d+\.\d+(?:\.\d+)?(?:-rc\d+)?)\b")
+_PATCH_RE = re.compile(
+    r"https?://\S+|(?:commit|patch)[:\s]+[0-9a-f]{7,40}",
+    re.IGNORECASE,
+)
+_VERSION_RE = re.compile(r"\b(\d+\.\d+(?:\.\d+)?(?:-[\w.]+)?)\b")
+_LOG_LINE_RE = re.compile(
+    r"^\[[\s\d.]+\]|^BUG:|^WARNING:|^Oops|^Call Trace|^RIP:|"
+    r"^Kernel panic|^systemd\[[0-9]+\]:|^dracut:|^grub",
+    re.IGNORECASE,
+)
 
-
-# ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _get(url: str, params: dict | None = None, retries: int = 3) -> dict | None:
     for attempt in range(retries):
         try:
-            r = requests.get(url, params=params, headers=HEADERS, timeout=20)
-            r.raise_for_status()
-            return r.json()
-        except requests.RequestException as e:
-            log.warning("GET %s failed (attempt %d/%d): %s", url, attempt+1, retries, e)
-            time.sleep(DELAY_SECONDS * (attempt + 1))
+            response = requests.get(url, params=params, headers=HEADERS, timeout=30)
+            response.raise_for_status()
+            return response.json()
+        except requests.RequestException as exc:
+            log.warning("GET %s failed (attempt %d/%d): %s", url, attempt + 1, retries, exc)
+            time.sleep(PAGE_DELAY_SECONDS * (attempt + 1))
     return None
 
 
-def _strip_html(html: str) -> str:
-    return BeautifulSoup(html, "html.parser").get_text(separator="\n")
+def _clean_text(text: str) -> str:
+    return re.sub(r"\n{3,}", "\n\n", (text or "").strip())
 
 
-def _extract_code_blocks(html: str) -> str:
-    soup = BeautifulSoup(html, "html.parser")
-    blocks = []
-    for tag in soup.find_all(["pre", "code"]):
-        txt = tag.get_text()
-        if len(txt.strip()) > 20:
-            blocks.append(txt.strip())
-    return "\n---\n".join(blocks)
-
-
-def _map_component_to_domain(component: str) -> str:
-    _MAP = {
-        "networking": "networking",
-        "drivers/net": "networking",
-        "fs": "filesystem",
-        "mm": "memory",
+def _map_component_to_domain(component: str, product: str, all_text: str) -> str:
+    combined = f"{component} {product} {all_text}".lower()
+    mapping = {
+        "network": "networking",
+        "wicked": "networking",
         "kernel": "kernel",
-        "arch": "kernel",
-        "security": "security",
-        "block": "storage",
-        "drivers/block": "storage",
-        "virt": "virtualization",
-        "drivers/gpu": "hardware",
-        "init": "boot",
         "systemd": "systemd",
+        "selinux": "security",
+        "apparmor": "security",
+        "ext4": "filesystem",
+        "btrfs": "filesystem",
+        "xfs": "filesystem",
+        "grub": "boot",
+        "dracut": "boot",
+        "initrd": "boot",
+        "kdump": "kernel",
+        "package": "package",
+        "zypper": "package",
+        "ssh": "security",
+        "storage": "storage",
     }
-    c = component.lower()
-    for key, domain in _MAP.items():
-        if key in c:
+    for needle, domain in mapping.items():
+        if needle in combined:
             return domain
-    return "kernel"   # default for bugzilla.kernel.org
+    return "other"
 
 
 def _map_failure_type(summary: str, comments_text: str) -> str:
-    combined = (summary + " " + comments_text).lower()
+    combined = f"{summary} {comments_text}".lower()
     if "panic" in combined:
         return "kernel panic"
     if "segfault" in combined or "segmentation fault" in combined:
         return "segfault"
-    if "permission denied" in combined:
+    if "permission denied" in combined or "selinux" in combined or "apparmor" in combined:
         return "permission"
     if "timeout" in combined:
         return "network timeout"
     if "corrupt" in combined:
         return "disk corruption"
-    if "depend" in combined or "missing module" in combined:
+    if "depend" in combined or "missing package" in combined:
         return "dependency"
     if "config" in combined or "misconfigur" in combined:
         return "config error"
     return "other"
 
 
-def _extract_version_scope(comments_text: str) -> str:
-    versions = _VERSION_RE.findall(comments_text)
-    if versions:
-        return ", ".join(sorted(set(versions))[:6])
-    return "unknown"
+def _infer_distro(product: str, op_sys: str, text: str) -> str:
+    if product:
+        return product
+    if op_sys and op_sys != "All":
+        return op_sys
+    return extract_distro(text)
 
 
-# ── Bug detail fetcher ────────────────────────────────────────────────────────
+def _extract_version_scope(version: str, text: str) -> str:
+    versions = _VERSION_RE.findall(text)
+    if version and version.lower() not in {"all", "current", "unknown", "unspecified"}:
+        versions.insert(0, version)
+    unique = []
+    for item in versions:
+        if item not in unique:
+            unique.append(item)
+    return ", ".join(unique[:8]) if unique else "unknown"
 
-def _fetch_bug_detail(bug_id: int) -> LinuxLynxDoc | None:
-    """Fetch a single bug and its comments; return a LinuxLynxDoc or None."""
-    data = _get(f"{REST_BASE}/bug/{bug_id}")
-    if not data or "bugs" not in data or not data["bugs"]:
-        return None
-    bug = data["bugs"][0]
 
-    # Only resolved+fixed
-    if bug.get("status") not in ("RESOLVED", "VERIFIED"):
-        return None
-    if bug.get("resolution") != "FIXED":
-        return None
+def _pick_raw_logs(comments: list[dict]) -> str:
+    candidates: list[str] = []
+    for comment in comments[:6]:
+        text = _clean_text(comment.get("text", ""))
+        if not text:
+            continue
 
-    summary     = bug.get("summary", "")
-    component   = bug.get("component", "unknown")
-    product     = bug.get("product", "")
-    creator     = bug.get("creator", "")
-    version     = bug.get("version", "unknown")
-    bug_url     = f"{BASE}/show_bug.cgi?id={bug_id}"
+        log_lines = [line for line in text.splitlines() if _LOG_LINE_RE.search(line)]
+        if log_lines:
+            candidates.append("\n".join(log_lines[:80]).strip())
 
-    # Fetch comments
-    cdata = _get(f"{REST_BASE}/bug/{bug_id}/comment")
-    if not cdata:
-        return None
+        if len(text) >= 120:
+            candidates.append(text[:2000])
 
-    comments = cdata.get("bugs", {}).get(str(bug_id), {}).get("comments", [])
+    for candidate in candidates:
+        if len(candidate.strip()) >= 50:
+            return candidate[:2000].strip()
+    return ""
+
+
+def _pick_fix_comment(comments: list[dict]) -> str:
+    for comment in reversed(comments):
+        text = _clean_text(comment.get("text", ""))
+        if not text:
+            continue
+        if _PATCH_RE.search(text) or _FIX_RE.search(text):
+            return text[:1200]
+    return _clean_text(comments[-1].get("text", ""))[:1200] if comments else ""
+
+
+def _fetch_comments(bug_id: int) -> list[dict]:
+    data = _get(f"{REST_BASE}/bug/{bug_id}/comment")
+    if not data:
+        return []
+    return data.get("bugs", {}).get(str(bug_id), {}).get("comments", [])
+
+
+def _build_doc_from_bug(bug: dict) -> LinuxLynxDoc | None:
+    bug_id = bug["id"]
+    comments = _fetch_comments(bug_id)
     if not comments:
         return None
 
-    # Bugzilla REST API returns comment text as plain text, not HTML.
-    # _extract_code_blocks (which looks for <pre>/<code> tags) will always
-    # return "" on plain text.  Use first_text directly as raw_logs.
-    first_text = _strip_html(comments[0].get("text", ""))
-    raw_logs = first_text
+    summary = bug.get("summary", "")
+    product = bug.get("product", "")
+    version = bug.get("version", "unknown")
+    component = bug.get("component", "unknown")
+    op_sys = bug.get("op_sys", "")
+    bug_url = f"{BASE}/show_bug.cgi?id={bug_id}"
 
-    if len(raw_logs.strip()) < 50:
-        # Try second comment
-        if len(comments) > 1:
-            raw_logs = _strip_html(comments[1].get("text", ""))
-        if len(raw_logs.strip()) < 50:
-            log.debug("Bug %d skipped: raw_logs too short", bug_id)
-            return None
-
-    # --- Find the resolution comment (last comment or one mentioning fix)
-    all_text   = "\n\n".join(_strip_html(c.get("text", "")) for c in comments)
-    fix_comment = ""
-    for c in reversed(comments):
-        t = _strip_html(c.get("text", ""))
-        if _COMMIT_RE.search(t) or _PATCH_RE.search(t) or "fixed" in t.lower():
-            fix_comment = t
-            break
-
-    if not fix_comment:
-        fix_comment = _strip_html(comments[-1].get("text", ""))
-
-    # --- Build fields
-    distro    = extract_distro(all_text)
-    kernel    = extract_kernel(all_text)
-    comp_name = extract_component(all_text, fallback=component)
-
-    # Infer debug_steps from middle comments (maintainer back-and-forth)
-    debug_comments = comments[1:-1] if len(comments) > 2 else []
-    debug_steps = "\n".join(
-        _strip_html(c.get("text", ""))[:300]
-        for c in debug_comments[:5]
-    ).strip()
-
-    # Root cause: look for explicit diagnosis language
-    root_cause = "unknown"
-    for pattern in [
-        r"(?:root cause|the (?:bug|issue|problem) (?:is|was)|cause[d]? by)[:\s]+(.{20,300})",
-        r"(?:introduced by|regression (?:from|since))[:\s]+(.{20,200})",
-    ]:
-        m = re.search(pattern, all_text, re.IGNORECASE | re.DOTALL)
-        if m:
-            root_cause = m.group(1).strip()[:400]
-            break
-
-    # Reasoning: pull explanation from fix comment
-    reasoning = ""
-    for pattern in [
-        r"(?:this fix|the fix|we (?:fix|resolve)|solution)[:\s]+(.{20,400})",
-        r"(?:because|the reason)[:\s]+(.{20,300})",
-    ]:
-        m = re.search(pattern, fix_comment, re.IGNORECASE | re.DOTALL)
-        if m:
-            reasoning = m.group(1).strip()[:500]
-            break
-
-    version_scope = _extract_version_scope(all_text)
-    if version != "unspecified":
-        version_scope = version if version_scope == "unknown" else version_scope
-
-    commit_match = _COMMIT_RE.search(all_text)
-    solution = fix_comment[:800].strip()
-    if commit_match:
-        solution = f"Commit {commit_match.group(1)}\n\n{solution}"
-
-    doc = LinuxLynxDoc.build(
-        doc_id     = f"bugzilla_{bug_id}",
-        source     = "bugzilla",
-        domain     = _map_component_to_domain(component),
-        failure_type = _map_failure_type(summary, all_text),
-        distro     = distro,
-        kernel     = kernel,
-        component  = comp_name,
-        problem    = summary,
-        raw_logs   = raw_logs[:2000].strip(),
-        debug_steps = debug_steps[:1000],
-        root_cause = root_cause,
-        solution   = solution,
-        reasoning  = reasoning,
-        version_scope = version_scope,
-        confidence = "high",   # bugzilla RESOLVED FIXED = high
-        link       = bug_url,
-    )
-
-    errs = doc.validate()
-    if errs:
-        log.debug("Bug %d validation errors: %s", bug_id, errs)
+    raw_logs = _pick_raw_logs(comments)
+    if len(raw_logs) < 50:
         return None
 
+    fix_comment = _pick_fix_comment(comments)
+    if len(fix_comment) < 20:
+        return None
+
+    all_text = "\n\n".join(_clean_text(comment.get("text", "")) for comment in comments if comment.get("text"))
+    middle_comments = comments[1:-1] if len(comments) > 2 else []
+    debug_steps = "\n---\n".join(
+        _clean_text(comment.get("text", ""))[:350]
+        for comment in middle_comments[:4]
+        if comment.get("text")
+    ).strip()
+
+    root_cause = "unknown"
+    for pattern in [
+        r"(?:root cause|the (?:problem|issue|bug) (?:is|was))[:\s]+(.{20,350})",
+        r"(?:caused by|triggered by|because)[:\s]+(.{20,350})",
+        r"(?:regression since|introduced by)[:\s]+(.{20,250})",
+    ]:
+        match = re.search(pattern, all_text, re.IGNORECASE | re.DOTALL)
+        if match:
+            root_cause = match.group(1).strip()[:400]
+            break
+
+    reasoning = ""
+    for pattern in [
+        r"(?:this fix|the fix|solution)[:\s]+(.{20,300})",
+        r"because[:\s]+(.{20,250})",
+    ]:
+        match = re.search(pattern, fix_comment, re.IGNORECASE | re.DOTALL)
+        if match:
+            reasoning = match.group(1).strip()[:400]
+            break
+
+    distro = _infer_distro(product, op_sys, all_text)
+    kernel = extract_kernel(f"{summary}\n{all_text}")
+    component_name = extract_component(all_text, fallback=component)
+
+    doc = LinuxLynxDoc.build(
+        doc_id=f"bugzilla_{bug_id}",
+        source="bugzilla",
+        domain=_map_component_to_domain(component, product, all_text),
+        failure_type=_map_failure_type(summary, all_text),
+        distro=distro,
+        kernel=kernel,
+        component=component_name,
+        problem=summary[:220],
+        raw_logs=raw_logs,
+        debug_steps=debug_steps[:1000],
+        root_cause=root_cause,
+        solution=fix_comment[:900],
+        reasoning=reasoning,
+        version_scope=_extract_version_scope(version, all_text),
+        confidence="high",
+        link=bug_url,
+    )
+
+    errors = doc.validate()
+    if errors:
+        log.debug("Bug %s validation errors: %s", bug_id, errors)
+        return None
     return doc
 
 
-# ── Main search loop ──────────────────────────────────────────────────────────
+def _search_bugs(max_candidates: int, keywords: list[str] | None = None) -> list[dict]:
+    search_terms = keywords or SEARCH_KEYWORDS
+    quicksearch = " OR ".join(f'"{term}"' if " " in term else term for term in search_terms)
+    offset = 0
+    seen_bug_ids: set[int] = set()
+    bugs: list[dict] = []
+
+    while len(bugs) < max_candidates:
+        page_size = min(PAGE_LIMIT, max_candidates - len(bugs))
+        params = {
+            "status": "RESOLVED",
+            "resolution": "FIXED",
+            "product": PRODUCTS,
+            "quicksearch": quicksearch,
+            "include_fields": (
+                "id,summary,component,version,status,resolution,creator,"
+                "last_change_time,product,op_sys"
+            ),
+            "order": "changeddate DESC",
+            "limit": page_size,
+            "offset": offset,
+        }
+
+        data = _get(SEARCH_URL, params=params)
+        if not data:
+            break
+
+        page_bugs = data.get("bugs", [])
+        if not page_bugs:
+            break
+
+        for bug in page_bugs:
+            bug_id = bug["id"]
+            if bug_id in seen_bug_ids:
+                continue
+            seen_bug_ids.add(bug_id)
+            bugs.append(bug)
+            if len(bugs) >= max_candidates:
+                break
+
+        offset += len(page_bugs)
+        if len(page_bugs) < page_size:
+            break
+        time.sleep(PAGE_DELAY_SECONDS)
+
+    return bugs
+
 
 def scrape(
     max_bugs: int = MAX_BUGS,
     keywords: list[str] | None = None,
 ) -> Generator[LinuxLynxDoc, None, None]:
     """
-    Yield LinuxLynxDoc objects for resolved+fixed kernel bugs.
-
-    Args:
-        max_bugs:  Maximum number of bugs to attempt (across all pages).
-        keywords:  If supplied, restrict to bugs whose summary matches.
+    Yield LinuxLynxDoc objects from recent resolved Linux Bugzilla issues.
     """
-    offset = 0
-    fetched = 0
+    candidate_target = max(12, max_bugs * 2)
+    candidates = _search_bugs(candidate_target, keywords=keywords)
+    if not candidates:
+        return
 
-    while fetched < max_bugs:
-        params: dict = {
-            "bug_status": "RESOLVED",
-            "limit":      PAGE_LIMIT,
-            "offset":     offset,
-            "include_fields": "id,summary,component,version,status,resolution,creator",
+    yielded = 0
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates))) as executor:
+        futures = {
+            executor.submit(_build_doc_from_bug, bug): bug["id"]
+            for bug in candidates
         }
-        if keywords:
-            params["summary"] = " ".join(keywords)
-
-        data = _get(SEARCH_URL, params=params)
-        if not data:
-            break
-
-        bugs = data.get("bugs", [])
-        if not bugs:
-            log.info("No more bugs at offset %d", offset)
-            break
-
-        for bug_meta in bugs:
-            if fetched >= max_bugs:
+        for future in as_completed(futures):
+            doc = future.result()
+            if not doc:
+                continue
+            yielded += 1
+            yield doc
+            if yielded >= max_bugs:
                 return
-            bug_id = bug_meta["id"]
-            log.info("Processing bug %d (%d/%d)", bug_id, fetched + 1, max_bugs)
-            time.sleep(DELAY_SECONDS)
 
-            doc = _fetch_bug_detail(bug_id)
-            if doc:
-                fetched += 1
-                yield doc
-            else:
-                log.debug("Bug %d skipped", bug_id)
-
-        offset += PAGE_LIMIT
-
-        # If we got fewer than PAGE_LIMIT, we've exhausted results
-        if len(bugs) < PAGE_LIMIT:
-            break
-
-
-# ── Entry point ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
-    import os
+
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     from src.dedup import Deduplicator
+
     deduper = Deduplicator()
-    
     output = sys.argv[1] if len(sys.argv) > 1 else "bugzilla_kernel.jsonl"
     count = 0
-    with open(output, "w") as fh:
+
+    with open(output, "w", encoding="utf-8") as handle:
         for doc in scrape(max_bugs=5):
             content_to_hash = doc.problem + doc.raw_logs + doc.solution
-            if not deduper.is_duplicate(content_to_hash):
-                fh.write(doc.to_jsonl() + "\n")
-                count += 1
-                print(f"  [{count}] NEW: {doc.doc_id}: {doc.problem[:60]}", file=sys.stderr)
-            else:
+            if deduper.is_duplicate(content_to_hash):
                 print(f"  [-] DUP: {doc.doc_id}", file=sys.stderr)
-        # save hashes
-        deduper._save_hashes()
+                continue
+            handle.write(doc.to_jsonl() + "\n")
+            count += 1
+            print(f"  [{count}] NEW: {doc.doc_id}: {doc.problem[:70]}", file=sys.stderr)
+
+    deduper._save_hashes()
     print(f"\nWrote {count} documents to {output}", file=sys.stderr)

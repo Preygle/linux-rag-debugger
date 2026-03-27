@@ -1,441 +1,431 @@
 """
-LKML / lore.kernel.org mailing list scraper
-============================================
-Source: https://lore.kernel.org/  (machine-readable Atom feeds + /raw/ endpoints)
+LKML scraper
+============
 
-Strategy
---------
-1. Search lore.kernel.org full-text search (/?q=...) for threads
-   containing known failure keywords.
-2. For each thread URL, fetch the Atom feed (append /?q=&x=A) to list messages.
-3. Fetch each message /raw/ to get plain-text content.
-4. Apply validity filters:
-   - Thread must contain a reply with a patch diff, commit hash, or "fix"
-   - Thread must NOT be [RFC] or [PATCH WIP]
-   - Original reporter must confirm fix OR thread marked as closed
-5. Map to LinuxLynxDoc schema.
-
-Rate limiting: 1 req/2s — lore.kernel.org is a public archiver.
+The original lore.kernel.org flow now lands on an Anubis proof-of-work page,
+which yields zero threads to plain HTTP clients. This version uses MARC's
+linux-kernel archive instead, where search results, thread pages, and message
+pages remain fetchable without JavaScript.
 """
 
 from __future__ import annotations
+
+import hashlib
+import logging
 import re
 import time
-import logging
-from email import message_from_string
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Generator
-from urllib.parse import urljoin, urlencode, quote_plus
+from urllib.parse import urlencode, urljoin
 
 import requests
-from bs4 import BeautifulSoup, XMLParsedAsHTMLWarning
-import warnings
+from bs4 import BeautifulSoup
 
-# The Atom feeds are XML, but html.parser works fine for extracting links.
-# We suppress the generic warning to keep the logs clean.
-warnings.filterwarnings("ignore", category=XMLParsedAsHTMLWarning)
+import sys
+import os
 
-import sys, os
-# Ensure project root is in path whether run directly or imported
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
 if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
-from src.schema import (
-    LinuxLynxDoc, extract_distro, extract_kernel,
-    extract_component, classify_risk,
-)
+
+from src.schema import LinuxLynxDoc, extract_component, extract_distro, extract_kernel
 
 log = logging.getLogger(__name__)
 
-BASE  = "https://lore.kernel.org"
-LISTS = [
-    "linux-kernel",     # LKML proper
-    "linux-mm",         # memory management
-    "linux-fsdevel",    # filesystem bugs
-    "netdev",           # networking
-    "linux-block",      # block/storage
-    "linux-security-module",
-]
+MARC_BASE = "https://marc.info/"
+LISTS = ["linux-kernel"]
 
 FAILURE_KEYWORDS = [
-    "kernel panic", "oops", "BUG:", "use-after-free", "null pointer",
-    "WARNING:", "WARN_ON", "segfault", "page fault", "hung task",
-    "deadlock", "race condition", "memory leak", "call trace",
-    "RIP:", "general protection fault",
+    "kernel panic",
+    "BUG:",
+    "hard lockup",
+    "use-after-free",
+    "null pointer",
+    "WARNING:",
+    "oops",
+    "call trace",
+    "page fault",
+    "hung task",
+    "deadlock",
+    "memory leak",
 ]
 
-DELAY_SECONDS  = 2.0
-MAX_THREADS    = 50  # per list per keyword
+DELAY_SECONDS = 0.2
+MAX_THREADS_PER_KEYWORD = 6
 MAX_TOTAL_DOCS = 300
+MAX_WORKERS = 4
+MAX_SEARCH_PAGES = 1
 
 HEADERS = {
-    "User-Agent": "LinuxLynx-DataCollector/1.0 (research; contact: dataset@linuxlynx.dev)"
+    "User-Agent": "LinuxLynx-DataCollector/2.0 (research; contact: dataset@linuxlynx.dev)"
 }
 
-# ── Patterns ─────────────────────────────────────────────────────────────────
-
-_PATCH_RE    = re.compile(r"^\+{3} |^-{3} |^diff --git|^index [0-9a-f]+\.\.", re.M)
-_COMMIT_RE   = re.compile(r"\b([0-9a-f]{12,40})\b")
-_FIXED_RE    = re.compile(
-    r"(?:fix(?:ed)?|applied|merged|thank[s]?|work[s]? now|confirmed|resolved)",
-    re.IGNORECASE,
+_PATCH_RE = re.compile(r"^diff --git|^\+{3}\s|^-{3}\s|^index [0-9a-f]+\.\.", re.M)
+_COMMIT_RE = re.compile(r"\b[0-9a-f]{12,40}\b")
+_FIXED_RE = re.compile(r"(?:fix(?:ed)?|applied|merged|resolved|works now|confirmed)", re.I)
+_RFC_RE = re.compile(r"\[RFC\]|\[PATCH.*WIP\]|\[PATCH v\d+ WIP\]", re.I)
+_VERSION_RE = re.compile(r"\b(\d+\.\d+(?:\.\d+)?(?:-[\w.]+)?)\b")
+_SUBJECT_JUNK = re.compile(r"^\s*(?:Re:\s*)+|\[PATCH[^\]]*\]\s*|\[RFC[^\]]*\]\s*", re.I)
+_SUBJECT_FAILURE_RE = re.compile(
+    r"\[bug\]|regression|kernel panic|hard lockup|use-after-free|null pointer|"
+    r"warning|oops|call trace|page fault|hung task|deadlock|memory leak",
+    re.I,
 )
-_RFC_RE      = re.compile(r"\[RFC\]|\[PATCH.*WIP\]|\[PATCH v\d+ WIP\]", re.IGNORECASE)
-_VERSION_RE  = re.compile(r"\b(\d+\.\d+(?:\.\d+)?(?:-rc\d+|-stable)?)\b")
-_SUBJECT_JUNK = re.compile(r"\[PATCH[^\]]*\]\s*|\[RFC[^\]]*\]\s*|Re:\s*", re.IGNORECASE)
-
-_DOMAIN_HINTS = {
-    "linux-mm":     "memory",
-    "linux-fsdevel":"filesystem",
-    "netdev":       "networking",
-    "linux-block":  "storage",
-    "linux-security-module": "security",
-    "linux-kernel": "kernel",
-}
+_FAILURE_RE = re.compile(
+    r"kernel panic|bug:|hard lockup|use-after-free|null pointer|warning:|"
+    r"oops|call trace|page fault|hung task|deadlock|memory leak",
+    re.I,
+)
+_LOG_LINE_RE = re.compile(
+    r"^\[[\s\d.]+\]|^BUG:|^WARNING:|^Oops|^Call Trace|^RIP:|^Kernel panic|"
+    r"^watchdog:|^CPU:\s+\d+",
+    re.I,
+)
 
 
-# ── HTTP helpers ──────────────────────────────────────────────────────────────
+def _marc_url(params: dict[str, str | int]) -> str:
+    return f"{MARC_BASE}?{urlencode(params)}"
 
-def _get(url: str, retries: int = 3) -> requests.Response | None:
+
+def _get(url: str, params: dict | None = None, retries: int = 3) -> requests.Response | None:
     for attempt in range(retries):
         try:
-            r = requests.get(url, headers=HEADERS, timeout=25)
-            r.raise_for_status()
-            return r
-        except requests.RequestException as e:
-            log.warning("GET %s failed (attempt %d): %s", url, attempt + 1, e)
+            response = requests.get(url, params=params, headers=HEADERS, timeout=25)
+            response.raise_for_status()
+            return response
+        except requests.RequestException as exc:
+            log.warning("GET %s failed (attempt %d/%d): %s", url, attempt + 1, retries, exc)
             time.sleep(DELAY_SECONDS * (attempt + 1))
     return None
 
 
-def _get_text(url: str) -> str:
-    r = _get(url)
-    return r.text if r else ""
+def _extract_message_body(pre_text: str) -> str:
+    parts = pre_text.split("\n\n", 1)
+    return parts[1].strip() if len(parts) == 2 else pre_text.strip()
 
 
-# ── Thread discovery ──────────────────────────────────────────────────────────
+def _fetch_message(message_url: str) -> dict | None:
+    response = _get(message_url)
+    if not response:
+        return None
 
-def _search_list(list_name: str, keyword: str, max_threads: int) -> list[str]:
-    """
-    Return thread URLs for `list_name` matching `keyword`.
-    Uses lore.kernel.org search endpoint.
-    """
-    q    = quote_plus(keyword)
-    # Do NOT use &x=A here — that returns an Atom/XML feed where links are
-    # in <link> elements, not <a> tags.  The plain HTML search results page
-    # has the <a href> links our parser expects.
-    url  = f"{BASE}/{list_name}/?q={q}"
-    html = _get_text(url)
-    if not html:
-        return []
+    soup = BeautifulSoup(response.text, "html.parser")
+    pre = soup.find("pre")
+    raw = pre.get_text("\n") if pre else soup.get_text("\n")
 
-    soup  = BeautifulSoup(html, "html.parser")
-    links = []
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        # Thread links look like /<list>/T/#<msg-id> or /<list>/<msg-id>/
-        if href.startswith(f"/{list_name}/") and "@" in href:
-            full = urljoin(BASE, href)
-            # Normalise to thread root
-            thread = re.sub(r"#.*$", "", full).rstrip("/")
-            if thread not in links:
-                links.append(thread)
-        if len(links) >= max_threads:
+    title = soup.title.get_text(" ", strip=True) if soup.title else ""
+    subject = re.sub(r"\s*-\s*MARC$", "", title).strip("' ")
+    if not subject:
+        match = re.search(r"^Subject:\s*(.+)$", raw, re.MULTILINE)
+        subject = match.group(1).strip() if match else ""
+
+    thread_url = ""
+    for anchor in soup.find_all("a", href=True):
+        href = anchor["href"]
+        if "t=" in href and "w=2" in href:
+            thread_url = urljoin(MARC_BASE, href)
             break
 
-    return links
+    return {
+        "url": message_url,
+        "thread_url": thread_url,
+        "subject": subject,
+        "raw": raw.strip(),
+        "body": _extract_message_body(raw),
+    }
 
 
-# ── Message fetching ──────────────────────────────────────────────────────────
+def _search_threads(keyword: str, max_threads: int) -> list[str]:
+    thread_urls: list[str] = []
+    seen_threads: set[str] = set()
+
+    for page in range(1, MAX_SEARCH_PAGES + 1):
+        if len(thread_urls) >= max_threads:
+            break
+
+        response = _get(
+            MARC_BASE,
+            params={"l": "linux-kernel", "q": "b", "s": keyword, "r": page, "w": 2},
+        )
+        if not response:
+            break
+
+        soup = BeautifulSoup(response.text, "html.parser")
+        message_urls: list[str] = []
+        for anchor in soup.find_all("a", href=True):
+            href = anchor["href"]
+            if "l=linux-kernel" in href and "m=" in href:
+                full_url = urljoin(MARC_BASE, href)
+                if full_url not in message_urls:
+                    message_urls.append(full_url)
+
+        if not message_urls:
+            break
+
+        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(message_urls))) as executor:
+            futures = {
+                executor.submit(_fetch_message, message_url): message_url
+                for message_url in message_urls[: max_threads * 2]
+            }
+            for future in as_completed(futures):
+                message = future.result()
+                if not message or not message["thread_url"]:
+                    continue
+                if message["thread_url"] in seen_threads:
+                    continue
+                seen_threads.add(message["thread_url"])
+                thread_urls.append(message["thread_url"])
+                if len(thread_urls) >= max_threads:
+                    break
+
+        time.sleep(DELAY_SECONDS)
+
+    return thread_urls
+
 
 def _fetch_thread_messages(thread_url: str) -> list[dict]:
-    """
-    Fetch all messages in a thread.
-    Uses the T/ (thread) endpoint and follows individual /raw/ links.
-    """
-    html = _get_text(thread_url + "/T/")
-    if not html:
+    response = _get(thread_url)
+    if not response:
         return []
 
-    soup = BeautifulSoup(html, "html.parser")
-    messages = []
+    soup = BeautifulSoup(response.text, "html.parser")
+    container = soup.find("pre") or soup
+    message_urls: list[str] = []
+    for anchor in container.find_all("a", href=True):
+        href = anchor["href"]
+        if "l=linux-kernel" in href and "m=" in href:
+            full_url = urljoin(MARC_BASE, href)
+            if full_url not in message_urls:
+                message_urls.append(full_url)
 
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-        # Individual message: href ends with / and contains @
-        if href.endswith("/") and "@" in href and not href.endswith("/T/"):
-            msg_url = urljoin(thread_url + "/T/", href)
-            raw_url = msg_url.rstrip("/") + "/raw"
-            raw     = _get_text(raw_url)
-            if raw:
-                messages.append({
-                    "url": msg_url,
-                    "raw": raw,
-                })
-            time.sleep(DELAY_SECONDS / 2)
+    if not message_urls:
+        return []
 
-    return messages
+    original_index = len(message_urls) - 1
+    resolution_index = 0
+    indexed_urls = [(original_index, message_urls[original_index])]
+    if len(message_urls) > 1:
+        indexed_urls.append((resolution_index, message_urls[resolution_index]))
+    fetched: list[tuple[int, dict]] = []
+
+    with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(indexed_urls))) as executor:
+        futures = {
+            executor.submit(_fetch_message, message_url): index
+            for index, message_url in indexed_urls
+        }
+        for future in as_completed(futures):
+            message = future.result()
+            if message:
+                fetched.append((futures[future], message))
+
+    fetched.sort(key=lambda item: item[0], reverse=True)
+    return [message for _, message in fetched]
 
 
-# ── Thread validation ─────────────────────────────────────────────────────────
+def _infer_domain(text: str) -> str:
+    lowered = text.lower()
+    if any(term in lowered for term in ("netdev", "ethernet", "wifi", "tcp", "udp", "nftables")):
+        return "networking"
+    if any(term in lowered for term in ("ext4", "btrfs", "xfs", "fsdevel", "mount")):
+        return "filesystem"
+    if any(term in lowered for term in ("selinux", "apparmor", "permission", "security")):
+        return "security"
+    if any(term in lowered for term in ("grub", "boot", "initramfs", "dracut")):
+        return "boot"
+    if any(term in lowered for term in ("memory leak", "mm/", "page fault")):
+        return "memory"
+    return "kernel"
+
+
+def _infer_failure_type(text: str) -> str:
+    lowered = text.lower()
+    if "panic" in lowered:
+        return "kernel panic"
+    if "segfault" in lowered or "use-after-free" in lowered or "null pointer" in lowered:
+        return "segfault"
+    if "permission" in lowered:
+        return "permission"
+    if "timeout" in lowered or "lockup" in lowered:
+        return "network timeout"
+    if "corrupt" in lowered:
+        return "disk corruption"
+    return "other"
+
+
+def _pick_raw_logs(body: str) -> str:
+    log_lines = [line for line in body.splitlines() if _LOG_LINE_RE.search(line)]
+    raw_logs = "\n".join(log_lines[:80]).strip()
+    if len(raw_logs) >= 50:
+        return raw_logs[:2000]
+
+    indented = "\n".join(
+        line for line in body.splitlines()
+        if line.startswith("  ") or line.startswith("\t")
+    ).strip()
+    if len(indented) >= 50:
+        return indented[:2000]
+
+    return body[:2000].strip()
+
 
 def _is_valid_thread(messages: list[dict]) -> bool:
-    """
-    A thread is valid if:
-    - NOT [RFC] or [PATCH WIP] in subject
-    - At least one message contains a patch diff OR commit hash
-    - Thread has at least 2 messages (report + response)
-    - Last few messages indicate resolution (fix confirmed / applied)
-    """
-    if not messages:
-        return False
-
-    # Check first message subject for RFC/WIP
-    first_raw = messages[0]["raw"]
-    subject_m = re.search(r"^Subject:\s*(.+)$", first_raw, re.MULTILINE)
-    subject   = subject_m.group(1) if subject_m else ""
-    if _RFC_RE.search(subject):
-        return False
-
-    all_text = "\n".join(m["raw"] for m in messages)
-
-    # Must have a patch or commit reference
-    has_patch  = bool(_PATCH_RE.search(all_text))
-    has_commit = bool(_COMMIT_RE.search(all_text))
-    if not (has_patch or has_commit):
-        return False
-
-    # Relaxed to 2 — a report + fix reply is sufficient
     if len(messages) < 2:
         return False
 
-    # _FIXED_RE was defined but never used before — check that the thread
-    # actually has a resolution signal in its later messages.
-    last_msgs = "\n".join(m["raw"] for m in messages[-4:])
-    if not _FIXED_RE.search(last_msgs) and not has_patch:
+    subject = messages[0]["subject"]
+    if _RFC_RE.search(subject):
+        return False
+    if not _SUBJECT_FAILURE_RE.search(subject):
+        return False
+
+    opening_text = f"{subject}\n{messages[0]['body']}"
+    if not _FAILURE_RE.search(opening_text):
+        return False
+
+    replies_text = "\n".join(message["body"] for message in messages[1:])
+    if not (_PATCH_RE.search(replies_text) or _COMMIT_RE.search(replies_text) or _FIXED_RE.search(replies_text)):
         return False
 
     return True
 
 
-# ── Document builder ──────────────────────────────────────────────────────────
-
-def _build_doc(
-    thread_url: str,
-    messages: list[dict],
-    list_name: str,
-) -> LinuxLynxDoc | None:
+def _build_doc(thread_url: str, messages: list[dict]) -> LinuxLynxDoc | None:
     if not messages:
         return None
 
-    first_raw   = messages[0]["raw"]
-    all_text    = "\n".join(m["raw"] for m in messages)
-    last_msgs   = "\n".join(m["raw"] for m in messages[-5:])
-
-    # Extract email headers from first message
-    try:
-        msg     = message_from_string(first_raw)
-        subject = msg.get("Subject", "").strip()
-        subject = _SUBJECT_JUNK.sub("", subject).strip()
-    except Exception:
-        subject = ""
-
-    # raw_logs: extract verbatim log blocks (lines starting with typical kernel log patterns)
-    log_lines = []
-    in_block  = False
-    for line in first_raw.splitlines():
-        if re.match(r"^\[[\s\d.]+\]|^BUG:|^WARNING:|^Oops|^Call Trace|^RIP:|^---", line):
-            in_block = True
-        if in_block:
-            log_lines.append(line)
-            if line.strip() == "" and len(log_lines) > 5:
-                in_block = False
-
-    raw_logs = "\n".join(log_lines[:60]).strip()
-    if len(raw_logs) < 50:
-        # Fallback 1: indented/code-like lines
-        raw_logs = "\n".join(
-            line for line in first_raw.splitlines()
-            if line.startswith("  ") or line.startswith("\t")
-        )[:2000].strip()
-
-    if len(raw_logs) < 50:
-        # Fallback 2: strip email headers and use the message body directly.
-        # Many valid bug reports are plain-text descriptions without log blocks.
-        body_lines = []
-        in_headers = True
-        for line in first_raw.splitlines():
-            if in_headers and line.strip() == "":
-                in_headers = False
-                continue
-            if not in_headers:
-                body_lines.append(line)
-        raw_logs = "\n".join(body_lines).strip()[:2000]
-
+    subject = _SUBJECT_JUNK.sub("", messages[0]["subject"]).strip()
+    first_body = messages[0]["body"]
+    raw_logs = _pick_raw_logs(first_body)
     if len(raw_logs) < 50:
         return None
 
-    # Debug steps: middle messages (maintainer Q&A)
-    debug_msgs  = messages[1:-2] if len(messages) > 3 else []
-    debug_steps = "\n---\n".join(m["raw"][:400] for m in debug_msgs[:5]).strip()
+    debug_steps = "\n---\n".join(message["body"][:350] for message in messages[1:-1]).strip()
 
-    # Root cause: look for diagnosis language
-    root_cause  = "unknown"
-    for pat in [
-        r"(?:the (?:bug|issue|cause) (?:is|was)|root cause)[:\s]+(.{20,400})",
-        r"(?:this happens because|triggered by)[:\s]+(.{20,300})",
-        r"(?:introduced in|regression since)[:\s]+(.{20,200})",
-    ]:
-        m2 = re.search(pat, all_text, re.IGNORECASE | re.DOTALL)
-        if m2:
-            root_cause = m2.group(1).strip()[:400]
-            break
-
-    # Solution: last message or message with patch
     solution = ""
-    for msg_d in reversed(messages):
-        if _PATCH_RE.search(msg_d["raw"]) or _COMMIT_RE.search(msg_d["raw"]):
-            solution = msg_d["raw"][:800].strip()
+    for message in reversed(messages[1:]):
+        body = message["body"]
+        if _PATCH_RE.search(body) or _COMMIT_RE.search(body) or _FIXED_RE.search(body):
+            solution = body[:900].strip()
             break
     if not solution:
-        solution = messages[-1]["raw"][:800].strip()
+        solution = messages[-1]["body"][:900].strip()
 
-    # Reasoning
-    reasoning = ""
-    for pat in [r"(?:this fix|the fix|solution)[:\s]+(.{20,400})", r"because[:\s]+(.{20,300})"]:
-        m2 = re.search(pat, solution, re.IGNORECASE | re.DOTALL)
-        if m2:
-            reasoning = m2.group(1).strip()[:400]
+    all_text = "\n\n".join(message["body"] for message in messages)
+    root_cause = "unknown"
+    for pattern in [
+        r"(?:root cause|the (?:bug|issue|problem) (?:is|was))[:\s]+(.{20,350})",
+        r"(?:triggered by|caused by|because)[:\s]+(.{20,320})",
+        r"(?:introduced in|regression since)[:\s]+(.{20,250})",
+    ]:
+        match = re.search(pattern, all_text, re.IGNORECASE | re.DOTALL)
+        if match:
+            root_cause = match.group(1).strip()[:400]
             break
 
-    # Environment
-    distro    = extract_distro(all_text)
-    kernel    = extract_kernel(all_text)
-    component = extract_component(all_text)
+    reasoning = ""
+    for pattern in [
+        r"(?:this fix|the fix|solution)[:\s]+(.{20,300})",
+        r"because[:\s]+(.{20,250})",
+    ]:
+        match = re.search(pattern, solution, re.IGNORECASE | re.DOTALL)
+        if match:
+            reasoning = match.group(1).strip()[:400]
+            break
 
-    # Version scope
-    versions  = _VERSION_RE.findall(all_text)
-    ver_scope = ", ".join(sorted(set(versions))[:6]) if versions else "unknown"
-
-    # Domain from list name
-    domain = _DOMAIN_HINTS.get(list_name, "kernel")
-
-    # Failure type
-    failure_type = "other"
-    combined = (subject + " " + first_raw[:2000]).lower()
-    if "panic" in combined:
-        failure_type = "kernel panic"
-    elif "segfault" in combined or "segmentation fault" in combined:
-        failure_type = "segfault"
-    elif "use-after-free" in combined or "null pointer" in combined:
-        failure_type = "segfault"
-    elif "permission" in combined:
-        failure_type = "permission"
-    elif "timeout" in combined:
-        failure_type = "network timeout"
-    elif "corrupt" in combined:
-        failure_type = "disk corruption"
-
-    # doc_id: hash of thread URL
-    import hashlib
-    uid = hashlib.md5(thread_url.encode()).hexdigest()[:12]
-
+    version_scope = ", ".join(dict.fromkeys(_VERSION_RE.findall(all_text))) or "unknown"
     doc = LinuxLynxDoc.build(
-        doc_id        = f"lkml_{uid}",
-        source        = "lkml",
-        domain        = domain,
-        failure_type  = failure_type,
-        distro        = distro,
-        kernel        = kernel,
-        component     = component,
-        problem       = subject or "Unknown kernel issue",
-        raw_logs      = raw_logs[:2000],
-        debug_steps   = debug_steps[:1000],
-        root_cause    = root_cause,
-        solution      = solution,
-        reasoning     = reasoning,
-        version_scope = ver_scope,
-        confidence    = "medium",   # mailing list = medium (needs confirmation)
-        link          = thread_url,
+        doc_id=f"lkml_{hashlib.md5(thread_url.encode()).hexdigest()[:12]}",
+        source="lkml",
+        domain=_infer_domain(f"{subject}\n{all_text}"),
+        failure_type=_infer_failure_type(f"{subject}\n{all_text}"),
+        distro=extract_distro(all_text),
+        kernel=extract_kernel(all_text),
+        component=extract_component(f"{subject}\n{all_text}"),
+        problem=subject or "Unknown kernel issue",
+        raw_logs=raw_logs,
+        debug_steps=debug_steps[:1000],
+        root_cause=root_cause,
+        solution=solution,
+        reasoning=reasoning,
+        version_scope=version_scope[:200],
+        confidence="medium",
+        link=thread_url,
     )
 
-    errs = doc.validate()
-    if errs:
-        log.debug("Thread %s validation: %s", thread_url, errs)
+    errors = doc.validate()
+    if errors:
+        log.debug("Thread %s validation errors: %s", thread_url, errors)
         return None
-
     return doc
 
 
-# ── Main scraper ──────────────────────────────────────────────────────────────
+def _build_thread_doc(thread_url: str) -> LinuxLynxDoc | None:
+    messages = _fetch_thread_messages(thread_url)
+    if not _is_valid_thread(messages):
+        return None
+    return _build_doc(thread_url, messages)
+
 
 def scrape(
     lists: list[str] = LISTS,
     keywords: list[str] = FAILURE_KEYWORDS,
-    max_threads_per_combo: int = 10,
+    max_threads_per_combo: int = MAX_THREADS_PER_KEYWORD,
     max_total: int = MAX_TOTAL_DOCS,
 ) -> Generator[LinuxLynxDoc, None, None]:
     """
-    Yield LinuxLynxDoc for resolved kernel mailing-list threads.
+    Yield LinuxLynxDoc objects from recent linux-kernel threads.
     """
-    seen_urls: set[str] = set()
+    del lists  # MARC search is scoped to linux-kernel only.
+
+    seen_threads: set[str] = set()
     total = 0
 
-    for list_name in lists:
+    for keyword in keywords:
         if total >= max_total:
             break
-        domain_hint = _DOMAIN_HINTS.get(list_name, "kernel")
-        log.info("Scanning list=%s", list_name)
 
-        for keyword in keywords:
-            if total >= max_total:
-                break
-            log.info("  keyword=%r", keyword)
+        thread_urls = _search_threads(keyword, max_threads_per_combo)
+        candidates = [thread_url for thread_url in thread_urls if thread_url not in seen_threads]
+        seen_threads.update(candidates)
+        if not candidates:
+            continue
 
-            thread_urls = _search_list(list_name, keyword, max_threads_per_combo)
-            log.info("  found %d candidate threads", len(thread_urls))
-            time.sleep(DELAY_SECONDS)
-
-            for t_url in thread_urls:
-                if t_url in seen_urls or total >= max_total:
+        with ThreadPoolExecutor(max_workers=min(MAX_WORKERS, len(candidates))) as executor:
+            futures = {
+                executor.submit(_build_thread_doc, thread_url): thread_url
+                for thread_url in candidates
+            }
+            for future in as_completed(futures):
+                doc = future.result()
+                if not doc:
                     continue
-                seen_urls.add(t_url)
+                total += 1
+                yield doc
+                if total >= max_total:
+                    return
 
-                log.info("    fetching thread: %s", t_url)
-                messages = _fetch_thread_messages(t_url)
-                time.sleep(DELAY_SECONDS)
-
-                if not _is_valid_thread(messages):
-                    log.debug("    thread invalid/unresolved, skipping")
-                    continue
-
-                doc = _build_doc(t_url, messages, list_name)
-                if doc:
-                    total += 1
-                    log.info("    → accepted doc %d: %s", total, doc.doc_id)
-                    yield doc
-
-
-# ── CLI ───────────────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     import sys
-    import os
+
     logging.basicConfig(level=logging.INFO, stream=sys.stderr)
     sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
     from src.dedup import Deduplicator
+
     deduper = Deduplicator()
-    
-    out = sys.argv[1] if len(sys.argv) > 1 else "lkml.jsonl"
+    output = sys.argv[1] if len(sys.argv) > 1 else "lkml.jsonl"
     count = 0
-    with open(out, "w") as fh:
+
+    with open(output, "w", encoding="utf-8") as handle:
         for doc in scrape(max_total=5):
             content_to_hash = doc.problem + doc.raw_logs + doc.solution
-            if not deduper.is_duplicate(content_to_hash):
-                fh.write(doc.to_jsonl() + "\n")
-                count += 1
-                print(f"[{count}] NEW: {doc.doc_id}: {doc.problem[:60]}")
-            else:
+            if deduper.is_duplicate(content_to_hash):
                 print(f"[-] DUP: {doc.doc_id}")
-        deduper._save_hashes()
-    print(f"\nWrote {count} docs → {out}")
+                continue
+            handle.write(doc.to_jsonl() + "\n")
+            count += 1
+            print(f"[{count}] NEW: {doc.doc_id}: {doc.problem[:70]}")
+
+    deduper._save_hashes()
+    print(f"\nWrote {count} docs -> {output}")

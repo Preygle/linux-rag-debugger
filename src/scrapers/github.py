@@ -7,19 +7,27 @@ load_dotenv()
 
 class GitHubScraper:
     def __init__(self, token=None):
-        self.token = token or os.getenv("GITHUB_ACCESS_TOKEN")
+        self.token = token or os.getenv("GITHUB_ACCESS_TOKEN") or os.getenv("GITHUB_TOKEN")
         try:
             self.g = Github(self.token, timeout=30)
-            # Verify authentication
-            try:
-                rate = self.g.get_rate_limit()
-                remaining = getattr(rate.core, 'remaining', None) or getattr(rate, 'rate', None)
-                if remaining is not None:
-                    print(f"GitHub API authenticated. Rate: {remaining}")
-                else:
-                    print(f"GitHub API authenticated.")
-            except Exception:
-                print("GitHub API client created (rate limit check skipped)")
+            if self.token:
+                try:
+                    self.g.get_user().login
+                    rate = self.g.get_rate_limit()
+                    remaining = getattr(rate.core, 'remaining', None) or getattr(rate, 'rate', None)
+                    if remaining is not None:
+                        print(f"GitHub API authenticated. Rate: {remaining}")
+                    else:
+                        print("GitHub API authenticated.")
+                except GithubException as e:
+                    if e.status == 401:
+                        print("GitHub token rejected, falling back to unauthenticated access.")
+                        self.token = None
+                        self.g = Github(timeout=30)
+                    else:
+                        raise
+            else:
+                print("GitHub API client created without authentication.")
         except Exception as e:
             print(f"Error initializing GitHub client: {e}")
             self.g = None
